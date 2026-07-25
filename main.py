@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-◢ SESSIONGUARD v1.1 — auth gateway / session shield for HTTP tools
+◢ SESSIONGUARD  — auth gateway / session shield for HTTP tools
   Made by Aryan Giri | giriaryan694-a11y
   GitHub: https://github.com/giriaryan694-a11y
 
@@ -77,7 +77,7 @@ def banner(host, port, target):
     print()
     print(f"  {A}{B}┌{ln}┐{X}")
     print(f"  {A}{B}│{'◢ S E S S I O N G U A R D':^46}│{X}")
-    print(f"  {A}{B}│{'v1.1 · auth gateway · session shield':^46}│{X}")
+    print(f"  {A}{B}│{' auth gateway · session shield':^46}│{X}")
     print(f"  {A}{B}└{ln}┘{X}")
     print(f"  {D}Made by{X} {B}Aryan Giri{X} {D}|{X} {C}giriaryan694-a11y{X}")
     print(f"  {D}github{X}   {C}{GITHUB_URL}{X}")
