@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-◢ SESSIONGUARD  — auth gateway / session shield for HTTP tools
+◢ SESSIONGUARD — auth gateway / session shield for HTTP tools
   Made by Aryan Giri | giriaryan694-a11y
   GitHub: https://github.com/giriaryan694-a11y
 
@@ -11,20 +11,18 @@
 
   Set the backend target from /admin → GATEWAY TARGET panel.
 
-  CHANGELOG v1.1 (bugfix pass):
-   - users.txt read-modify-write is now atomic under a global lock (was
-     racy across concurrent admin API calls / logins -> could silently
-     lose edits).
-   - AS (allowed-sessions) check-and-create at login is now atomic, so
-     two simultaneous logins from the same user can no longer both slip
-     past the limit.
+  CHANGELOG (bugfix pass):
+   - users.txt read-modify-write is now atomic under a global lock.
+   - AS (allowed-sessions) check-and-create at login is now atomic.
    - read_admin_record() no longer crashes on an empty admin_auth.txt.
-   - Cookie stripping in the gateway now matches cookie *names* exactly
-     instead of doing a raw string-prefix match (was a footgun for any
-     backend cookie named e.g. "sg_sidebar").
-   - cli_add_user() now rejects the username reserved for the admin
-     account, matching the /admin API behaviour.
-   - Credit line is now a real clickable link to the GitHub profile.
+   - Cookie stripping in the gateway matches cookie *names* exactly.
+   - cli_add_user() rejects the username reserved for the admin account.
+   - Credit line is a real clickable link to the GitHub profile.
+   - Removed the hardcoded default gateway target.
+   - Login CSRF now uses a server-side single-use token store instead of
+     a cookie, fixing cross-browser / privacy-extension failures.
+   - Login page no longer reveals the backend target address.
+   - Startup banner no longer advertises /admin.
 """
 import argparse, hashlib, hmac, json, os, re, secrets, sys, threading, time
 from urllib.parse import quote
@@ -47,7 +45,6 @@ CONFIG_DB   = DATA / "config.json"
 ROUNDS      = 200_000
 SESSION_TTL = 60 * 60 * 12
 SID_COOKIE  = "sg_sid"
-PRE_COOKIE  = "sg_pre"
 LOCK_ATTEMPTS, LOCK_SECONDS = 5, 300
 ALL_METHODS = ["GET","POST","PUT","DELETE","PATCH","OPTIONS","HEAD"]
 CRED_HASH_RE = re.compile(r"^[0-9a-f]{32}\$[0-9a-f]{64}$")
@@ -60,8 +57,13 @@ GITHUB_URL  = "https://github.com/giriaryan694-a11y"
 CREDIT_HTML = (f'<a href="{GITHUB_URL}" target="_blank" rel="noopener noreferrer">'
                f'MADE BY ARYAN GIRI | GIRIARYAN694-A11Y</a>')
 
-_lock   = threading.RLock()   # global lock — guards sessions.json, users.txt, events.json
+_lock   = threading.RLock()
 _fails  = {}
+# Server-side single-use CSRF token store for the login form.
+# Maps token_string -> expiry_timestamp.  Cleaned lazily on each login GET.
+_csrf_tokens: dict[str, float] = {}
+CSRF_TOKEN_TTL = 600  # 10 minutes
+
 app     = Flask(__name__)
 
 # ═══════════════════════ BANNER / CREDIT ═══════════════════════
@@ -77,18 +79,23 @@ def banner(host, port, target):
     print()
     print(f"  {A}{B}┌{ln}┐{X}")
     print(f"  {A}{B}│{'◢ S E S S I O N G U A R D':^46}│{X}")
-    print(f"  {A}{B}│{' auth gateway · session shield':^46}│{X}")
+    print(f"  {A}{B}│{'auth gateway · session shield':^46}│{X}")
     print(f"  {A}{B}└{ln}┘{X}")
     print(f"  {D}Made by{X} {B}Aryan Giri{X} {D}|{X} {C}giriaryan694-a11y{X}")
     print(f"  {D}github{X}   {C}{GITHUB_URL}{X}")
     print(f"  {D}{ln}{X}")
     print(f"  {G}▸ listen{X}    http://{host}:{port}")
-    print(f"  {G}▸ target{X}    {target}")
-    print(f"  {G}▸ admin{X}     http://{host}:{port}/admin")
+    if target:
+        print(f"  {G}▸ target{X}    {target}")
+    else:
+        print(f"  {R}▸ target{X}    NOT CONFIGURED — traffic will not be proxied{X}")
     print(f"  {G}▸ guards{X}    {G}csrf · lockout · AS limits{X}")
     print(f"  {D}{ln}{X}")
     print(f"  {R}▲ point cloudflared at gateway :{port}, NOT the tool{X}")
-    print(f"  {D}▲ change target live from /admin → GATEWAY TARGET{X}")
+    if target:
+        print(f"  {D}▲ change target live from the admin panel → GATEWAY TARGET{X}")
+    else:
+        print(f"  {R}▲ set the target: log in as admin → GATEWAY TARGET{X}")
     print()
 
 def mini_banner():
@@ -511,7 +518,6 @@ TPL_LOGIN = _HTML_HEAD + r"""
     <p class="gate-sub">AUTH GATEWAY &middot; SESSION ENFORCEMENT &middot; AS LIMITS</p>
     <ul class="gate-status">
       <li><span>GATEWAY STATE</span><b class="ok">ARMED <i class="dot dot-live"></i></b></li>
-      <li><span>TARGET BACKEND</span><b>{{ backend }}</b></li>
       <li><span>CREDENTIAL STORE</span><b>users.txt &middot; PBKDF2-SHA256</b></li>
       <li><span>GUARDS</span><b class="ok">CSRF &middot; LOCKOUT &middot; AS</b></li>
       <li><span>GATEWAY TIME</span><b id="gate-clock">--:--:--</b></li>
@@ -525,13 +531,13 @@ TPL_LOGIN = _HTML_HEAD + r"""
     </header>
     <div class="console-body">
       <div class="boot">
-        <p class="boot-line" style="--d:.1s">SessionGuard v1.1 &mdash; auth gateway online</p>
+        <p class="boot-line" style="--d:.1s">SessionGuard &mdash; auth gateway online</p>
         <p class="boot-line" style="--d:.5s">csrf guard armed &middot; bruteforce lockout armed &middot; AS policy enforcing</p>
         <p class="boot-line" style="--d:.9s">present credentials<span class="cursor">&#9610;</span></p>
       </div>
       {% if error %}<div class="gate-error">&#9650; {{ error }}</div>{% endif %}
       <form method="post" class="gate-form" autocomplete="off">
-        <input type="hidden" name="csrf_token" value="{{ pre }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <input type="hidden" name="next" value="{{ next }}">
         <label class="field"><span class="field-key">OPERATOR ID</span>
           <input class="field-in" name="username" required autofocus spellcheck="false"></label>
@@ -570,11 +576,14 @@ TPL_ADMIN = _HTML_HEAD + r"""
       <h2 class="panel-title">GATEWAY TARGET</h2>
       <span class="dim mono" id="cfg-status"></span>
     </header>
+    {% if not backend %}
+    <div class="gate-error" style="margin:14px 16px 0">&#9650; NOT CONFIGURED &mdash; the gateway will refuse to proxy any traffic until you set a target below.</div>
+    {% endif %}
     <div class="config-row">
-      <input class="field-in" id="cfg-target" value="{{ backend }}" spellcheck="false" placeholder="http://127.0.0.1:8080">
+      <input class="field-in" id="cfg-target" value="{{ backend }}" spellcheck="false" placeholder="e.g. http://127.0.0.1:8080 &mdash; wherever your tool actually listens">
       <button class="btn btn-amber" id="btn-save-target">SAVE ROUTE</button>
     </div>
-    <p class="hint config-hint">Where authenticated traffic is forwarded. Change live &mdash; no restart needed. Keep your tool bound to 127.0.0.1.</p>
+    <p class="hint config-hint">Where authenticated traffic is forwarded. No default is set on purpose &mdash; point this at your tool yourself. Change live &mdash; no restart needed. Keep your tool bound to 127.0.0.1.</p>
   </section>
   <div class="grid">
     <section class="panel">
@@ -687,9 +696,26 @@ TPL_DOWN = _HTML_HEAD + r"""
     </header>
     <div class="console-body center">
       <p class="err-code">502</p>
-      <p class="err-msg">BACKEND UNREACHABLE &mdash; <span class="mono">{{ backend }}</span></p>
-      <p class="hint">Is your tool running there? Set the target from /admin &rarr; GATEWAY TARGET.</p>
+      <p class="err-msg">BACKEND UNREACHABLE</p>
+      <p class="hint">Is your tool running? An admin can set the target from the admin panel &rarr; GATEWAY TARGET.</p>
       <a class="btn" href="/">RETRY GATEWAY</a>
+    </div>
+  </section>
+</main>
+""" + _HTML_FOOT
+
+TPL_NOTARGET = _HTML_HEAD + r"""
+<main class="gate-wrap solo">
+  <section class="gate-console">
+    <header class="console-bar">
+      <span class="bar-dots"><i></i><i></i><i></i></span>
+      <span class="bar-title">SESSIONGUARD &middot; GATEWAY NOT CONFIGURED</span>
+    </header>
+    <div class="console-body center">
+      <p class="err-code">&#9888;</p>
+      <p class="err-msg">NO GATEWAY TARGET SET</p>
+      <p class="hint">SessionGuard ships with no default backend on purpose &mdash; nobody has told it where your tool lives yet. An admin needs to set one from the admin panel &rarr; GATEWAY TARGET before any traffic can be forwarded.</p>
+      <a class="btn btn-amber" href="/admin">GO TO ADMIN</a>
     </div>
   </section>
 </main>
@@ -712,13 +738,13 @@ def _save(p, obj):
 
 # ═══════════════════════ GATEWAY CONFIG ═══════════════════════
 def load_config():
-    return _load(CONFIG_DB, {"target": "http://127.0.0.1:8080"})
+    return _load(CONFIG_DB, {"target": ""})
 
 def save_config(cfg):
     _save(CONFIG_DB, cfg)
 
 def get_target():
-    return load_config().get("target", "http://127.0.0.1:8080")
+    return (load_config().get("target") or "").strip()
 
 # ═══════════════════════ CRYPTO ═══════════════════════
 def hash_password(pw, salt=None):
@@ -735,8 +761,6 @@ def verify_password(pw, stored):
         return False
 
 def read_admin_record():
-    """Returns (name, hashed_record) or (None, None). Never raises, even on an
-    empty or malformed admin_auth.txt — a crash here would 500 every request."""
     if not ADMIN_AUTH.exists(): return None, None
     lines = ADMIN_AUTH.read_text().strip().splitlines()
     if not lines: return None, None
@@ -777,9 +801,6 @@ def save_users(users):
     os.chmod(USERS_TXT, 0o600)
 
 def verify_user(name, pw, users):
-    """NOTE: caller must already hold `_lock` if it plans to keep using
-    `users` afterwards for further mutation — this function may rewrite
-    users.txt out from under a stale in-memory copy otherwise."""
     u = users.get(name)
     if not u: return False
     if CRED_HASH_RE.match(u["cred"]):
@@ -872,6 +893,30 @@ def log_event(kind, detail):
         ev.insert(0, {"ts": _now(), "kind": kind, "detail": detail})
         _save(EVENTS_DB, ev[:100])
 
+# ═══════════════════════ SERVER-SIDE LOGIN CSRF TOKENS ═══════════════════════
+def _purge_csrf_tokens():
+    """Remove expired single-use CSRF tokens from the in-memory store."""
+    now = _now()
+    expired = [k for k, exp in _csrf_tokens.items() if exp < now]
+    for k in expired:
+        del _csrf_tokens[k]
+
+def issue_login_csrf():
+    """Generate a single-use CSRF token for the login form, stored server-side."""
+    _purge_csrf_tokens()
+    token = secrets.token_urlsafe(32)
+    _csrf_tokens[token] = _now() + CSRF_TOKEN_TTL
+    return token
+
+def consume_login_csrf(token):
+    """Validate and consume a single-use login CSRF token. Returns True if valid."""
+    if not token:
+        return False
+    exp = _csrf_tokens.pop(token, None)
+    if exp is None:
+        return False
+    return exp >= _now()
+
 # ═══════════════════════ HARDENING ═══════════════════════
 def page(tpl, status=200, **ctx):
     ctx.setdefault("extra_head", "")
@@ -903,10 +948,10 @@ def record_fail(key):
     return c
 
 def csrf_ok(sess):
+    """Validate CSRF for authenticated (post-login) forms.
+    Checks the session-bound CSRF token submitted via form field or header."""
     tok = request.form.get("csrf_token", "") or request.headers.get("X-CSRF-Token", "")
     if not tok: return False
-    pre = request.cookies.get(PRE_COOKIE, "")
-    if pre and hmac.compare_digest(tok, pre): return True
     return bool(sess) and hmac.compare_digest(tok, sess.get("csrf", ""))
 
 def admin_required(fn):
@@ -955,21 +1000,26 @@ def login():
         tok, sess = get_session()
         if sess:
             return redirect("/admin" if sess["role"] == "admin" else safe_next(request.args.get("next")))
-        pre = secrets.token_urlsafe(24)
-        resp = page(TPL_LOGIN, title="SessionGuard // AUTH REQUIRED", bodyclass="gate",
-                    backend=get_target(), pre=pre, next=safe_next(request.args.get("next")),
+        csrf_token = issue_login_csrf()
+        return page(TPL_LOGIN, title="SessionGuard // AUTH REQUIRED", bodyclass="gate",
+                    csrf_token=csrf_token, next=safe_next(request.args.get("next")),
                     error=ERR_MAP.get(request.args.get("err")))
-        resp.set_cookie(PRE_COOKIE, pre, httponly=True, samesite="Lax", max_age=600)
-        return resp
+
+    # --- POST: authenticate ---
     ip = request.remote_addr or "?"
     name = request.form.get("username", "").strip()
     pw   = request.form.get("password", "")
     nxt  = safe_next(request.form.get("next"))
-    if not csrf_ok(None):
-        return _login_page("CSRF CHECK FAILED — reload and retry", nxt), 403
+
+    # Validate single-use server-side CSRF token
+    submitted_csrf = request.form.get("csrf_token", "")
+    if not consume_login_csrf(submitted_csrf):
+        return _login_page("CSRF CHECK FAILED — reload the page and retry", nxt), 403
+
     if locked(f"ip:{ip}") or locked(f"u:{name.lower()}"):
         log_event("lockout", f"login locked for '{name}' / {ip}")
         return _login_page("BRUTEFORCE GUARD — too many attempts, locked 5 min", nxt), 423
+
     admin_name, admin_rec = read_admin_record()
     if admin_rec and admin_name and hmac.compare_digest(name, admin_name) and verify_password(pw, admin_rec):
         _fails.pop(f"ip:{ip}", None)
@@ -979,11 +1029,6 @@ def login():
         return resp
 
     key = name.lower()
-    # --- Atomic check-and-create: hold the global lock across the whole
-    #     "verify credentials -> check AS limit -> create session" sequence
-    #     so two simultaneous logins for the same user can't both slip past
-    #     the AS (allowed-sessions) limit. This is what makes "AS:1" truly
-    #     mean "only one browser/device at a time" under concurrent load. ---
     with _lock:
         users = load_users()
         u = users.get(key)
@@ -993,8 +1038,9 @@ def login():
             if count_sessions(key) >= u["as"]:
                 log_event("as_block", f"'{key}' denied: AS {u['as']} reached from {ip}")
                 return _login_page(
-                    f"SESSION LIMIT REACHED (AS {u['as']}) — log out from your other device "
-                    f"at /auth/portal, or contact the administrator", nxt), 403
+                    f"SESSION LIMIT REACHED — your account allows {u['as']} concurrent "
+                    f"session(s) and all are in use. Log out from another device at "
+                    f"/auth/portal or contact the administrator.", nxt), 403
             token = create_session(key, "user", ip, request.user_agent.string)
             resp = set_sid(make_response(redirect(nxt)), token)
             log_event("auth", f"user '{key}' logged in from {ip}")
@@ -1006,11 +1052,9 @@ def login():
     return _login_page("ACCESS DENIED — invalid credentials", nxt), 401
 
 def _login_page(error, nxt="/"):
-    pre = secrets.token_urlsafe(24)
-    resp = page(TPL_LOGIN, title="SessionGuard // AUTH REQUIRED", bodyclass="gate",
-                backend=get_target(), pre=pre, next=nxt, error=error, shake=True)
-    resp.set_cookie(PRE_COOKIE, pre, httponly=True, samesite="Lax", max_age=600)
-    return resp
+    csrf_token = issue_login_csrf()
+    return page(TPL_LOGIN, title="SessionGuard // AUTH REQUIRED", bodyclass="gate",
+                csrf_token=csrf_token, next=nxt, error=error, shake=True)
 
 @app.route("/auth/logout", methods=["POST"])
 def logout():
@@ -1150,6 +1194,7 @@ def api_edit_user(u):
         if u not in users:
             return jsonify(ok=False, error="no such user"), 404
         changes = []
+        old_as = users[u]["as"]
         if "enabled" in d:
             users[u]["enabled"] = bool(d["enabled"])
             changes.append("enabled" if users[u]["enabled"] else "disabled")
@@ -1158,16 +1203,12 @@ def api_edit_user(u):
                 new = max(1, min(50, int(d["as"])))
             except (TypeError, ValueError):
                 return jsonify(ok=False, error="invalid AS"), 400
-            old = users[u]["as"]
             users[u]["as"] = new
-            changes.append(f"AS {old}->{new}")
+            changes.append(f"AS {old_as}->{new}")
         save_users(users)
         disabled_now = "enabled" in d and not users[u]["enabled"]
-        as_shrunk = "as" in d and users[u]["as"] < (old if "as" in d else 0)
+        as_shrunk = "as" in d and users[u]["as"] < old_as
         new_as_limit = users[u]["as"]
-    # kill/evict happen after releasing the users.txt lock (they touch sessions.json,
-    # which has its own critical sections) but before responding, so state is
-    # always consistent by the time the API call returns.
     if disabled_now:
         n = kill_all_for(u)
         if n: changes.append(f"{n} session(s) revoked")
@@ -1261,18 +1302,18 @@ def gateway(path):
                 return redirect("/auth/login?err=disabled")
         touch(tok, sess)
     target = get_target()
+    if request.method != "OPTIONS" and not target:
+        if sess and sess.get("role") == "admin":
+            return redirect("/admin")
+        return page(TPL_NOTARGET, title="SessionGuard // NOT CONFIGURED", bodyclass="gate"), 503
     headers = {k: v for k, v in request.headers if k.lower() not in STRIP_REQ}
-    # Strip our own auth cookies by exact name (not raw string-prefix) so a
-    # backend cookie that merely *starts with* "sg_sid"/"sg_pre" (e.g. a
-    # hypothetical "sg_sidebar" cookie set by the proxied tool) isn't
-    # accidentally dropped on its way to the backend.
     kept = []
     for part in request.headers.get("Cookie", "").split(";"):
         part = part.strip()
         if not part:
             continue
         cname = part.split("=", 1)[0].strip()
-        if cname not in (SID_COOKIE, PRE_COOKIE):
+        if cname not in (SID_COOKIE,):
             kept.append(part)
     if kept:
         headers["Cookie"] = "; ".join(kept)
@@ -1287,7 +1328,7 @@ def gateway(path):
                         params=request.query_string.decode(), data=request.get_data(),
                         headers=headers, stream=True, timeout=(5, 300), allow_redirects=False)
     except rq.RequestException:
-        return page(TPL_DOWN, title="SessionGuard // 502", bodyclass="gate", backend=target), 502
+        return page(TPL_DOWN, title="SessionGuard // 502", bodyclass="gate"), 502
     resp = Response(up.iter_content(chunk_size=65536), status=up.status_code)
     for k, v in up.raw.headers.items():
         if k.lower() not in STRIP_RESP:
@@ -1342,9 +1383,9 @@ if __name__ == "__main__":
                     help="allowed sessions for --add-user")
     ap.add_argument("--list-users", action="store_true")
     ap.add_argument("--target", default=None,
-                    help="initial backend (changeable later from /admin)")
+                    help="initial backend (changeable later from admin panel)")
     ap.add_argument("--host", default="0.0.0.0",
-                    help="bind address (default: 0.0.0.0 — the shield faces outward)")
+                    help="bind address (default: 0.0.0.0)")
     ap.add_argument("--port", type=int, default=8000)
     args = ap.parse_args()
 
