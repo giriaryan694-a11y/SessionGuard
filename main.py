@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-◢ SESSIONGUARD v1.0 — auth gateway / session shield for HTTP tools
+◢ SESSIONGUARD v1.1 — auth gateway / session shield for HTTP tools
   Made by Aryan Giri | giriaryan694-a11y
+  GitHub: https://github.com/giriaryan694-a11y
 
   python sessionguard.py --set-admin
   python sessionguard.py --add-user admin2 --as 1
@@ -9,6 +10,21 @@
   cloudflared tunnel --url http://127.0.0.1:8000
 
   Set the backend target from /admin → GATEWAY TARGET panel.
+
+  CHANGELOG v1.1 (bugfix pass):
+   - users.txt read-modify-write is now atomic under a global lock (was
+     racy across concurrent admin API calls / logins -> could silently
+     lose edits).
+   - AS (allowed-sessions) check-and-create at login is now atomic, so
+     two simultaneous logins from the same user can no longer both slip
+     past the limit.
+   - read_admin_record() no longer crashes on an empty admin_auth.txt.
+   - Cookie stripping in the gateway now matches cookie *names* exactly
+     instead of doing a raw string-prefix match (was a footgun for any
+     backend cookie named e.g. "sg_sidebar").
+   - cli_add_user() now rejects the username reserved for the admin
+     account, matching the /admin API behaviour.
+   - Credit line is now a real clickable link to the GitHub profile.
 """
 import argparse, hashlib, hmac, json, os, re, secrets, sys, threading, time
 from urllib.parse import quote
@@ -40,7 +56,11 @@ CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' 
        "https://fonts.googleapis.com; font-src https://fonts.gstatic.com; "
        "img-src 'self' data:; object-src 'none'; base-uri 'self'; form-action 'self'")
 
-_lock   = threading.RLock()
+GITHUB_URL  = "https://github.com/giriaryan694-a11y"
+CREDIT_HTML = (f'<a href="{GITHUB_URL}" target="_blank" rel="noopener noreferrer">'
+               f'MADE BY ARYAN GIRI | GIRIARYAN694-A11Y</a>')
+
+_lock   = threading.RLock()   # global lock — guards sessions.json, users.txt, events.json
 _fails  = {}
 app     = Flask(__name__)
 
@@ -57,9 +77,10 @@ def banner(host, port, target):
     print()
     print(f"  {A}{B}┌{ln}┐{X}")
     print(f"  {A}{B}│{'◢ S E S S I O N G U A R D':^46}│{X}")
-    print(f"  {A}{B}│{'v1.0 · auth gateway · session shield':^46}│{X}")
+    print(f"  {A}{B}│{'v1.1 · auth gateway · session shield':^46}│{X}")
     print(f"  {A}{B}└{ln}┘{X}")
     print(f"  {D}Made by{X} {B}Aryan Giri{X} {D}|{X} {C}giriaryan694-a11y{X}")
+    print(f"  {D}github{X}   {C}{GITHUB_URL}{X}")
     print(f"  {D}{ln}{X}")
     print(f"  {G}▸ listen{X}    http://{host}:{port}")
     print(f"  {G}▸ target{X}    {target}")
@@ -72,7 +93,7 @@ def banner(host, port, target):
 
 def mini_banner():
     print(f"\n  \033[38;5;214m\033[1m◢ SESSIONGUARD\033[0m"
-          f" \033[2m— Made by Aryan Giri | giriaryan694-a11y\033[0m\n")
+          f" \033[2m— Made by Aryan Giri | giriaryan694-a11y · {GITHUB_URL}\033[0m\n")
 
 # ═══════════════════════ EMBEDDED CSS ═══════════════════════
 GUARD_CSS = r"""
@@ -245,6 +266,8 @@ tr.flash{animation:rowflash 1s ease-out}
 .toast{background:var(--panel);border:1px solid var(--line-hi);border-left:3px solid var(--cyan);padding:11px 16px;font:500 12.5px var(--mono);box-shadow:0 12px 30px -10px #000;animation:toastin .25s;max-width:340px}
 .toast.ok{border-left-color:var(--green)}.toast.err{border-left-color:var(--red)}.toast.warn{border-left-color:var(--amber)}
 @keyframes toastin{from{opacity:0;transform:translateX(16px)}}
+.gate-foot a,.credit a{color:var(--amber);text-decoration:none;border-bottom:1px solid rgba(255,180,84,.35);transition:border-color .15s,color .15s}
+.gate-foot a:hover,.credit a:hover{color:var(--amber-hi);border-color:var(--amber-hi)}
 @media(max-width:1080px){
   .grid{grid-template-columns:1fr}
   .gate-wrap{grid-template-columns:1fr;gap:36px;padding-top:64px}
@@ -502,7 +525,7 @@ TPL_LOGIN = _HTML_HEAD + r"""
     </header>
     <div class="console-body">
       <div class="boot">
-        <p class="boot-line" style="--d:.1s">SessionGuard v1.0 &mdash; auth gateway online</p>
+        <p class="boot-line" style="--d:.1s">SessionGuard v1.1 &mdash; auth gateway online</p>
         <p class="boot-line" style="--d:.5s">csrf guard armed &middot; bruteforce lockout armed &middot; AS policy enforcing</p>
         <p class="boot-line" style="--d:.9s">present credentials<span class="cursor">&#9610;</span></p>
       </div>
@@ -516,7 +539,7 @@ TPL_LOGIN = _HTML_HEAD + r"""
           <input class="field-in" type="password" name="password" required></label>
         <button class="btn btn-amber btn-block" type="submit">AUTHENTICATE <span class="arr">&rarr;</span></button>
       </form>
-      <footer class="gate-foot">ALL ACTIVITY IS LOGGED &middot; MADE BY ARYAN GIRI | GIRIARYAN694-A11Y</footer>
+      <footer class="gate-foot">ALL ACTIVITY IS LOGGED &middot; {{ credit|safe }}</footer>
     </div>
   </section>
 </main>
@@ -568,6 +591,7 @@ TPL_ADMIN = _HTML_HEAD + r"""
           <tbody id="users-body"><tr><td colspan="5" class="row-empty">loading registry&hellip;</td></tr></tbody>
         </table>
       </div>
+      <p class="hint" style="padding:0 16px 14px;margin:0">AS = allowed sessions. AS 1 means a user can only be logged in on one browser/device at a time &mdash; a second login attempt is blocked until they free a slot from /auth/portal or you kill the session here.</p>
     </section>
     <aside class="rail">
       <section class="panel">
@@ -580,7 +604,7 @@ TPL_ADMIN = _HTML_HEAD + r"""
       </section>
     </aside>
   </div>
-  <footer class="credit">SESSIONGUARD &mdash; MADE BY ARYAN GIRI <span>|</span> GIRIARYAN694-A11Y</footer>
+  <footer class="credit">SESSIONGUARD &mdash; {{ credit|safe }}</footer>
 </main>
 <div class="modal-backdrop" id="modal-user" hidden>
   <div class="modal">
@@ -648,7 +672,7 @@ TPL_PORTAL = _HTML_HEAD + r"""
           <button class="btn btn-danger" type="submit">END ALL MY SESSIONS</button>
         </form>
       </div>
-      <footer class="gate-foot">SESSIONGUARD &middot; MADE BY ARYAN GIRI | GIRIARYAN694-A11Y</footer>
+      <footer class="gate-foot">SESSIONGUARD &middot; {{ credit|safe }}</footer>
     </div>
   </section>
 </main>
@@ -711,8 +735,12 @@ def verify_password(pw, stored):
         return False
 
 def read_admin_record():
+    """Returns (name, hashed_record) or (None, None). Never raises, even on an
+    empty or malformed admin_auth.txt — a crash here would 500 every request."""
     if not ADMIN_AUTH.exists(): return None, None
-    line = ADMIN_AUTH.read_text().strip().splitlines()[0]
+    lines = ADMIN_AUTH.read_text().strip().splitlines()
+    if not lines: return None, None
+    line = lines[0]
     if "|" not in line: return None, None
     n, r = line.split("|", 1)
     return n.strip(), r.strip()
@@ -749,13 +777,19 @@ def save_users(users):
     os.chmod(USERS_TXT, 0o600)
 
 def verify_user(name, pw, users):
+    """NOTE: caller must already hold `_lock` if it plans to keep using
+    `users` afterwards for further mutation — this function may rewrite
+    users.txt out from under a stale in-memory copy otherwise."""
     u = users.get(name)
     if not u: return False
     if CRED_HASH_RE.match(u["cred"]):
         return verify_password(pw, u["cred"])
     if hmac.compare_digest(pw, u["cred"]):
-        u["cred"] = hash_password(pw)
-        save_users(users)
+        with _lock:
+            fresh = load_users()
+            if name in fresh:
+                fresh[name]["cred"] = hash_password(pw)
+                save_users(fresh)
         log_event("cred_upgrade", f"'{name}' plaintext credential auto-hashed on login")
         return True
     return False
@@ -841,6 +875,7 @@ def log_event(kind, detail):
 # ═══════════════════════ HARDENING ═══════════════════════
 def page(tpl, status=200, **ctx):
     ctx.setdefault("extra_head", "")
+    ctx.setdefault("credit", CREDIT_HTML)
     resp = make_response(render_template_string(tpl, **ctx), status)
     resp.headers.update({"Content-Security-Policy": CSP, "X-Content-Type-Options": "nosniff",
                          "X-Frame-Options": "DENY", "Referrer-Policy": "no-referrer",
@@ -942,21 +977,29 @@ def login():
                        create_session(name, "admin", ip, request.user_agent.string))
         log_event("auth", f"admin '{name}' logged in from {ip}")
         return resp
-    users = load_users()
+
     key = name.lower()
-    u = users.get(key)
-    if u and u["enabled"] and verify_user(key, pw, users):
-        _fails.pop(f"ip:{ip}", None)
-        _fails.pop(f"u:{key}", None)
-        if count_sessions(key) >= u["as"]:
-            log_event("as_block", f"'{key}' denied: AS {u['as']} reached from {ip}")
-            return _login_page(
-                f"SESSION LIMIT REACHED (AS {u['as']}) — log out from your other device "
-                f"at /auth/portal, or contact the administrator", nxt), 403
-        resp = set_sid(make_response(redirect(nxt)),
-                       create_session(key, "user", ip, request.user_agent.string))
-        log_event("auth", f"user '{key}' logged in from {ip}")
-        return resp
+    # --- Atomic check-and-create: hold the global lock across the whole
+    #     "verify credentials -> check AS limit -> create session" sequence
+    #     so two simultaneous logins for the same user can't both slip past
+    #     the AS (allowed-sessions) limit. This is what makes "AS:1" truly
+    #     mean "only one browser/device at a time" under concurrent load. ---
+    with _lock:
+        users = load_users()
+        u = users.get(key)
+        if u and u["enabled"] and verify_user(key, pw, users):
+            _fails.pop(f"ip:{ip}", None)
+            _fails.pop(f"u:{key}", None)
+            if count_sessions(key) >= u["as"]:
+                log_event("as_block", f"'{key}' denied: AS {u['as']} reached from {ip}")
+                return _login_page(
+                    f"SESSION LIMIT REACHED (AS {u['as']}) — log out from your other device "
+                    f"at /auth/portal, or contact the administrator", nxt), 403
+            token = create_session(key, "user", ip, request.user_agent.string)
+            resp = set_sid(make_response(redirect(nxt)), token)
+            log_event("auth", f"user '{key}' logged in from {ip}")
+            return resp
+
     record_fail(f"ip:{ip}")
     record_fail(f"u:{key}")
     log_event("auth_fail", f"failed login '{name}' from {ip}")
@@ -1086,59 +1129,66 @@ def api_create_user():
         return jsonify(ok=False, error="username: 2-32 chars, a-z 0-9 _ . -"), 400
     if len(pw) < 8:
         return jsonify(ok=False, error="passkey must be >= 8 characters"), 400
-    users = load_users()
-    admin_name, _ = read_admin_record()
-    if name == (admin_name or "").lower():
-        return jsonify(ok=False, error="reserved username"), 409
-    if name in users:
-        return jsonify(ok=False, error="user already exists"), 409
-    users[name] = {"cred": hash_password(pw), "as": as_n, "enabled": True}
-    save_users(users)
+    with _lock:
+        users = load_users()
+        admin_name, _ = read_admin_record()
+        if name == (admin_name or "").lower():
+            return jsonify(ok=False, error="reserved username"), 409
+        if name in users:
+            return jsonify(ok=False, error="user already exists"), 409
+        users[name] = {"cred": hash_password(pw), "as": as_n, "enabled": True}
+        save_users(users)
     log_event("user_create", f"user '{name}' provisioned (AS {as_n})")
     return jsonify(ok=True)
 
 @app.route("/api/users/<u>", methods=["PATCH"])
 @admin_api
 def api_edit_user(u):
-    users = load_users()
-    if u not in users:
-        return jsonify(ok=False, error="no such user"), 404
     d = request.get_json(silent=True) or {}
-    changes = []
-    if "enabled" in d:
-        users[u]["enabled"] = bool(d["enabled"])
-        changes.append("enabled" if users[u]["enabled"] else "disabled")
-        if not users[u]["enabled"]:
-            n = kill_all_for(u)
-            if n:
-                changes.append(f"{n} session(s) revoked")
-    if "as" in d:
-        try:
-            new = max(1, min(50, int(d["as"])))
-        except (TypeError, ValueError):
-            return jsonify(ok=False, error="invalid AS"), 400
-        old = users[u]["as"]
-        users[u]["as"] = new
-        changes.append(f"AS {old}->{new}")
-        if new < old:
-            k = evict_excess(u, new)
-            if k:
-                changes.append(f"{k} session(s) evicted")
-    save_users(users)
+    with _lock:
+        users = load_users()
+        if u not in users:
+            return jsonify(ok=False, error="no such user"), 404
+        changes = []
+        if "enabled" in d:
+            users[u]["enabled"] = bool(d["enabled"])
+            changes.append("enabled" if users[u]["enabled"] else "disabled")
+        if "as" in d:
+            try:
+                new = max(1, min(50, int(d["as"])))
+            except (TypeError, ValueError):
+                return jsonify(ok=False, error="invalid AS"), 400
+            old = users[u]["as"]
+            users[u]["as"] = new
+            changes.append(f"AS {old}->{new}")
+        save_users(users)
+        disabled_now = "enabled" in d and not users[u]["enabled"]
+        as_shrunk = "as" in d and users[u]["as"] < (old if "as" in d else 0)
+        new_as_limit = users[u]["as"]
+    # kill/evict happen after releasing the users.txt lock (they touch sessions.json,
+    # which has its own critical sections) but before responding, so state is
+    # always consistent by the time the API call returns.
+    if disabled_now:
+        n = kill_all_for(u)
+        if n: changes.append(f"{n} session(s) revoked")
+    elif "as" in d and as_shrunk:
+        k = evict_excess(u, new_as_limit)
+        if k: changes.append(f"{k} session(s) evicted")
     log_event("user_edit", f"'{u}' updated: {', '.join(changes)}")
     return jsonify(ok=True)
 
 @app.route("/api/users/<u>/password", methods=["POST"])
 @admin_api
 def api_reset_pass(u):
-    users = load_users()
-    if u not in users:
-        return jsonify(ok=False, error="no such user"), 404
     pw = str((request.get_json(silent=True) or {}).get("password", ""))
     if len(pw) < 8:
         return jsonify(ok=False, error="passkey must be >= 8 characters"), 400
-    users[u]["cred"] = hash_password(pw)
-    save_users(users)
+    with _lock:
+        users = load_users()
+        if u not in users:
+            return jsonify(ok=False, error="no such user"), 404
+        users[u]["cred"] = hash_password(pw)
+        save_users(users)
     n = kill_all_for(u)
     log_event("pass_reset", f"passkey of '{u}' reset · {n} session(s) revoked")
     return jsonify(ok=True)
@@ -1153,11 +1203,12 @@ def api_kill_all(u):
 @app.route("/api/users/<u>", methods=["DELETE"])
 @admin_api
 def api_delete_user(u):
-    users = load_users()
-    if u not in users:
-        return jsonify(ok=False, error="no such user"), 404
-    del users[u]
-    save_users(users)
+    with _lock:
+        users = load_users()
+        if u not in users:
+            return jsonify(ok=False, error="no such user"), 404
+        del users[u]
+        save_users(users)
     n = kill_all_for(u)
     log_event("user_delete", f"user '{u}' deleted · {n} session(s) purged")
     return jsonify(ok=True)
@@ -1211,8 +1262,18 @@ def gateway(path):
         touch(tok, sess)
     target = get_target()
     headers = {k: v for k, v in request.headers if k.lower() not in STRIP_REQ}
-    kept = [p.strip() for p in request.headers.get("Cookie", "").split(";")
-            if p.strip() and not p.strip().startswith((SID_COOKIE, PRE_COOKIE))]
+    # Strip our own auth cookies by exact name (not raw string-prefix) so a
+    # backend cookie that merely *starts with* "sg_sid"/"sg_pre" (e.g. a
+    # hypothetical "sg_sidebar" cookie set by the proxied tool) isn't
+    # accidentally dropped on its way to the backend.
+    kept = []
+    for part in request.headers.get("Cookie", "").split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        cname = part.split("=", 1)[0].strip()
+        if cname not in (SID_COOKIE, PRE_COOKIE):
+            kept.append(part)
     if kept:
         headers["Cookie"] = "; ".join(kept)
     else:
@@ -1255,8 +1316,12 @@ def cli_set_admin():
 def cli_add_user(name, as_n):
     import getpass
     mini_banner()
-    users = load_users()
     name = name.lower()
+    admin_name, _ = read_admin_record()
+    if admin_name and name == admin_name.lower():
+        print(f"  '{name}' is the reserved admin username — pick another")
+        return
+    users = load_users()
     if name in users and input(f"  '{name}' exists — overwrite? [y/N] ").lower() != "y":
         return
     pw = getpass.getpass(f"  Passkey for {name} (min 8): ")
