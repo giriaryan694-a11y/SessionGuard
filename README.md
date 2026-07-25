@@ -1,11 +1,11 @@
-
+````md
 ┌──────────────────────────────────────────────┐
 │        ◢ S E S S I O N G U A R D            │
 │        · auth gateway · session shield       │
 └──────────────────────────────────────────────┘
 
 Made by Aryan Giri | giriaryan694-a11y
-
+````
 # ◢ SessionGuard
 
 **SessionGuard** is a secure HTTP authentication gateway and session enforcement shield for local web tools.
@@ -287,19 +287,5 @@ sessionguard/
 
 ## Made by
 
-```text
-Made by Aryan Giri | giriaryan694-a11y
-GitHub: https://github.com/giriaryan694-a11y
-```
-
----
-
-## Credits
-
-```text
-◢ SESSIONGUARD
-auth gateway · session shield · AS enforcement
-```
-
-```
-```
+* Made by Aryan Giri | giriaryan694-a11y
+* GitHub: https://github.com/giriaryan694-a11y
