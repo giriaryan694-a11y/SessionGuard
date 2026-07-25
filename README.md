@@ -1,4 +1,4 @@
-````md
+
 ┌──────────────────────────────────────────────┐
 │        ◢ S E S S I O N G U A R D            │
 │        · auth gateway · session shield       │
