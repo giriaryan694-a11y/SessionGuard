@@ -11,20 +11,39 @@
 
   Set the backend target from /admin → GATEWAY TARGET panel.
 
-  CHANGELOG (bugfix pass):
-   - users.txt read-modify-write is now atomic under a global lock.
-   - AS (allowed-sessions) check-and-create at login is now atomic.
-   - read_admin_record() no longer crashes on an empty admin_auth.txt.
-   - Cookie stripping in the gateway matches cookie *names* exactly.
-   - cli_add_user() rejects the username reserved for the admin account.
-   - Credit line is a real clickable link to the GitHub profile.
-   - Removed the hardcoded default gateway target.
-   - Login CSRF now uses a server-side single-use token store instead of
-     a cookie, fixing cross-browser / privacy-extension failures.
-   - Login page no longer reveals the backend target address.
-   - Startup banner no longer advertises /admin.
+  users.txt line format:
+    username:credential [AS:n] [TARGET:http://host:port] [TTL:seconds]
+                         [IP:a.b.c.d,cidr,...] [UA:substr,substr,...] [OFF]
+  AS      = allowed concurrent sessions (default 1)
+  TARGET  = per-user backend override (falls back to the global gateway target)
+  TTL     = per-user session lifetime in seconds (falls back to global default)
+  IP      = comma-separated IPs/CIDRs this account may log in / connect from.
+            Blank/absent = no per-user IP restriction (admin "enables" this
+            restriction simply by setting the field from the user editor).
+  UA      = comma-separated case-insensitive substrings; the browser's
+            User-Agent must contain at least one to be allowed. Blank/absent
+            = no per-user UA restriction.
+  OFF     = account disabled
+
+  CHANGELOG (feature pass):
+   - Passwords now hashed with scrypt (N=16384,r=8,p=1); legacy PBKDF2 hashes
+     still verify and are transparently upgraded to scrypt on next login.
+   - Sessions carry a device label (auto-derived from UA, renameable).
+   - Session TTL is admin-configurable globally and per-user (TTL: token).
+   - Activity log supports filtering (kind/user/since) and CSV/JSON export.
+   - Simple sliding-window rate limiting on the gateway and the admin API.
+   - Light/dark ("eye-saver" amber) theme toggle, persisted client-side.
+   - IP allow/deny rules (exact IPs or CIDR ranges), enforced gateway + login.
+   - Per-user backend routing via TARGET: token in users.txt, so e.g. robby
+     can be routed to :8080 and bibi to :7070 while everyone else uses the
+     global GATEWAY TARGET.
+   - Per-user IP allowlist (IP:) and User-Agent allowlist (UA:) tokens: the
+     admin can lock a specific account to only log in / stay logged in from
+     given IPs/CIDRs and/or browsers. Enforced at login AND on every
+     subsequent gateway/portal request (a session is killed mid-flight if
+     the source IP or UA stops matching).
 """
-import argparse, hashlib, hmac, json, os, re, secrets, sys, threading, time
+import argparse, csv, hashlib, hmac, io, ipaddress, json, os, re, secrets, sys, threading, time
 from urllib.parse import quote
 from functools import wraps
 from pathlib import Path
@@ -42,13 +61,24 @@ SESSIONS_DB = DATA / "sessions.json"
 EVENTS_DB   = DATA / "events.json"
 CONFIG_DB   = DATA / "config.json"
 
-ROUNDS      = 200_000
-SESSION_TTL = 60 * 60 * 12
+PBKDF2_ROUNDS   = 200_000                 # legacy verify-only
+SCRYPT_N, SCRYPT_R, SCRYPT_P = 2 ** 14, 8, 1   # ~16-32MB, current default
+DEFAULT_SESSION_TTL = 60 * 60 * 12        # 12h, admin-configurable
 SID_COOKIE  = "sg_sid"
 LOCK_ATTEMPTS, LOCK_SECONDS = 5, 300
+RATE_LIMIT_MAX, RATE_LIMIT_WINDOW = 240, 60    # admin-configurable
 ALL_METHODS = ["GET","POST","PUT","DELETE","PATCH","OPTIONS","HEAD"]
-CRED_HASH_RE = re.compile(r"^[0-9a-f]{32}\$[0-9a-f]{64}$")
-LINE_RE = re.compile(r"^\s*([A-Za-z0-9_.-]{2,32}):(\S+)(?:\s+AS:(\d+))?\s*(OFF)?\s*(?:#.*)?$")
+PBKDF2_HASH_RE = re.compile(r"^[0-9a-f]{32}\$[0-9a-f]{64}$")
+SCRYPT_HASH_RE = re.compile(r"^scrypt\$\d+\$\d+\$\d+\$[0-9a-f]{32}\$[0-9a-f]+$")
+LINE_RE = re.compile(
+    r"^\s*([A-Za-z0-9_.-]{2,32}):(\S+)"
+    r"(?:\s+AS:(\d+))?"
+    r"(?:\s+TARGET:(\S+))?"
+    r"(?:\s+TTL:(\d+))?"
+    r"(?:\s+IP:(\S+))?"
+    r"(?:\s+UA:(\S+))?"
+    r"\s*(OFF)?\s*(?:#.*)?$"
+)
 CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' "
        "https://fonts.googleapis.com; font-src https://fonts.gstatic.com; "
        "img-src 'self' data:; object-src 'none'; base-uri 'self'; form-action 'self'")
@@ -59,22 +89,19 @@ CREDIT_HTML = (f'<a href="{GITHUB_URL}" target="_blank" rel="noopener noreferrer
 
 _lock   = threading.RLock()
 _fails  = {}
-# Server-side single-use CSRF token store for the login form.
-# Maps token_string -> expiry_timestamp.  Cleaned lazily on each login GET.
+# server-side single-use CSRF token store for the login form
 _csrf_tokens: dict[str, float] = {}
 CSRF_TOKEN_TTL = 600  # 10 minutes
+# sliding-window rate limiter state: key -> [timestamps]
+_rl_hits: dict[str, list] = {}
+_rl_lock = threading.RLock()
 
 app     = Flask(__name__)
 
 # ═══════════════════════ BANNER / CREDIT ═══════════════════════
 def banner(host, port, target):
-    A = "\033[38;5;214m"
-    G = "\033[38;5;78m"
-    C = "\033[38;5;75m"
-    R = "\033[38;5;196m"
-    D = "\033[2m"
-    B = "\033[1m"
-    X = "\033[0m"
+    A = "\033[38;5;214m"; G = "\033[38;5;78m"; C = "\033[38;5;75m"
+    R = "\033[38;5;196m"; D = "\033[2m"; B = "\033[1m"; X = "\033[0m"
     ln = "─" * 46
     print()
     print(f"  {A}{B}┌{ln}┐{X}")
@@ -86,10 +113,10 @@ def banner(host, port, target):
     print(f"  {D}{ln}{X}")
     print(f"  {G}▸ listen{X}    http://{host}:{port}")
     if target:
-        print(f"  {G}▸ target{X}    {target}")
+        print(f"  {G}▸ target{X}    {target} (default)")
     else:
         print(f"  {R}▸ target{X}    NOT CONFIGURED — traffic will not be proxied{X}")
-    print(f"  {G}▸ guards{X}    {G}csrf · lockout · AS limits{X}")
+    print(f"  {G}▸ guards{X}    {G}csrf · lockout · AS limits · rate-limit · ip rules{X}")
     print(f"  {D}{ln}{X}")
     print(f"  {R}▲ point cloudflared at gateway :{port}, NOT the tool{X}")
     if target:
@@ -110,10 +137,16 @@ GUARD_CSS = r"""
   --amber:#ffb454;--amber-hi:#ffc678;--green:#43d9a3;--red:#ff5d5d;--cyan:#5bc8ff;
   --mono:'IBM Plex Mono',ui-monospace,monospace;--disp:'Chakra Petch',sans-serif;--body:'IBM Plex Sans',system-ui,sans-serif;
 }
+html[data-theme="light"]{
+  --ink:#faf6ec;--panel:#fff8e6;--panel2:#fdf1d6;--line:#e8dcb8;--line-hi:#d8c58e;
+  --text:#3a2f18;--dim:#6b5a34;--faint:#8f7c4f;
+  --amber:#b5790a;--amber-hi:#8f5f06;--green:#1f8f6a;--red:#c0392b;--cyan:#0e6ba8;
+  color-scheme:light;
+}
 *{margin:0;padding:0;box-sizing:border-box}
 [hidden]{display:none!important}
 html{color-scheme:dark}
-body{background:var(--ink);color:var(--text);font-family:var(--body);font-size:14px;min-height:100vh}
+body{background:var(--ink);color:var(--text);font-family:var(--body);font-size:14px;min-height:100vh;transition:background .2s,color .2s}
 ::selection{background:rgba(255,180,84,.3)}
 ::-webkit-scrollbar{width:9px;height:9px}
 ::-webkit-scrollbar-thumb{background:#22333b;border:2px solid var(--ink)}
@@ -129,7 +162,9 @@ body{background:var(--ink);color:var(--text);font-family:var(--body);font-size:1
   background-size:44px 44px;mask-image:radial-gradient(ellipse at 50% 0%,#000 30%,transparent 78%)}
 .scanlines{position:fixed;inset:0;z-index:50;pointer-events:none;opacity:.3;
   background:repeating-linear-gradient(0deg,rgba(0,0,0,.18) 0 1px,transparent 1px 3px)}
+html[data-theme="light"] .scanlines{opacity:.08}
 .console-bar{display:flex;align-items:center;gap:12px;padding:10px 16px;border-bottom:1px solid var(--line);background:#0d1519}
+html[data-theme="light"] .console-bar{background:#f3e9c9}
 .bar-dots i{width:9px;height:9px;border-radius:50%;display:inline-block;margin-right:5px;background:#2b4049}
 .bar-dots i:first-child{background:var(--red)}.bar-dots i:nth-child(2){background:var(--amber)}.bar-dots i:last-child{background:var(--green)}
 .bar-title{font:600 10.5px var(--mono);letter-spacing:.22em;color:var(--dim);flex:1}
@@ -142,16 +177,20 @@ body{background:var(--ink);color:var(--text);font-family:var(--body);font-size:1
   background:rgba(21,33,38,.6);color:var(--text);cursor:pointer;text-decoration:none;display:inline-block;
   clip-path:polygon(8px 0,100% 0,100% calc(100% - 8px),calc(100% - 8px) 100%,0 100%,0 8px);
   transition:transform .18s,box-shadow .18s,background .18s,border-color .18s,color .18s}
+html[data-theme="light"] .btn{background:rgba(255,248,230,.7)}
 .btn:hover{transform:translateY(-1px);border-color:var(--cyan);color:#fff;
   box-shadow:0 0 0 1px rgba(91,200,255,.25),0 8px 20px -10px rgba(91,200,255,.45)}
+html[data-theme="light"] .btn:hover{color:#0b1114}
 .btn .arr{display:inline-block;transition:transform .18s}
 .btn:hover .arr{transform:translateX(3px)}
 .btn-amber{background:var(--amber);color:#1a1206;border-color:var(--amber)}
 .btn-amber:hover{background:var(--amber-hi);border-color:var(--amber-hi);color:#1a1206;box-shadow:0 0 20px -4px rgba(255,180,84,.6)}
 .btn-danger{border-color:rgba(255,93,93,.5);color:#ffb3b3}
+html[data-theme="light"] .btn-danger{color:#8a1f14}
 .btn-danger:hover{border-color:var(--red);color:#fff;box-shadow:0 0 0 1px rgba(255,93,93,.3)}
 .btn-block{width:100%;padding:12px;text-align:center}
 .btn-ico{width:28px;height:28px;border:1px solid var(--line);background:#0d1519;color:var(--dim);font-size:13px;cursor:pointer;transition:.15s;margin-left:4px}
+html[data-theme="light"] .btn-ico{background:#fdf1d6}
 .btn-ico:hover{color:var(--cyan);border-color:var(--cyan);transform:translateY(-1px)}
 .btn-ico-danger:hover{color:var(--red);border-color:var(--red)}
 .btn-ico:disabled{opacity:.25;cursor:not-allowed;transform:none}
@@ -159,6 +198,7 @@ body{background:var(--ink);color:var(--text);font-family:var(--body);font-size:1
 .field{display:block;margin-bottom:16px}
 .field-key{font:500 10px var(--mono);letter-spacing:.16em;color:var(--dim);display:block;margin-bottom:6px}
 .field-in{width:100%;background:#0b1216;border:1px solid var(--line);color:var(--text);font:500 14px var(--mono);padding:10px 12px;outline:0;transition:border-color .15s,box-shadow .15s}
+html[data-theme="light"] .field-in{background:#fffdf5}
 .field-in:focus{border-color:var(--amber);box-shadow:0 0 0 1px rgba(255,180,84,.3),0 0 16px -6px rgba(255,180,84,.5)}
 .field-sm{padding:7px 10px;font-size:12px;width:150px}
 .field.check{display:flex;align-items:center;gap:9px;font:600 10.5px var(--mono);letter-spacing:.14em;color:var(--dim)}
@@ -183,6 +223,7 @@ body{background:var(--ink);color:var(--text);font-family:var(--body);font-size:1
 .cursor{color:var(--green);animation:blink 1s steps(1) infinite;margin-left:4px}
 @keyframes blink{50%{opacity:0}}
 .gate-error{background:rgba(255,93,93,.1);border:1px solid rgba(255,93,93,.4);color:#ffb3b3;font:500 12px var(--mono);padding:10px 12px;margin-bottom:16px;line-height:1.6}
+html[data-theme="light"] .gate-error{color:#8a1f14}
 .gate-foot{margin-top:18px;font:400 9.5px var(--mono);letter-spacing:.18em;color:var(--faint);text-align:center}
 .shake{animation:shake .45s}
 @keyframes shake{20%{transform:translateX(-9px)}40%{transform:translateX(7px)}60%{transform:translateX(-5px)}80%{transform:translateX(3px)}}
@@ -195,12 +236,17 @@ body{background:var(--ink);color:var(--text);font-family:var(--body);font-size:1
 .err-code{font:700 84px/1 var(--disp);color:var(--red);text-shadow:0 0 30px rgba(255,93,93,.4)}
 .err-msg{font:600 13px var(--mono);letter-spacing:.1em;margin:14px 0 10px}
 .topbar{display:flex;justify-content:space-between;align-items:center;gap:14px;padding:13px 26px;border-bottom:1px solid var(--line);background:rgba(13,20,24,.88);backdrop-filter:blur(6px);position:sticky;top:0;z-index:20}
+html[data-theme="light"] .topbar{background:rgba(250,246,236,.9)}
 .brand{font:700 17px var(--disp);letter-spacing:.1em;display:flex;align-items:center;gap:10px}
 .brand-mark{color:var(--amber);font-size:20px}
 .brand-tag{font:600 9px var(--mono);letter-spacing:.18em;color:var(--faint);border:1px solid var(--line);padding:3px 8px}
 .top-right{display:flex;align-items:center;gap:14px}
 .clock{font:500 12px var(--mono);letter-spacing:.12em;color:var(--dim)}
 .chip{display:inline-flex;align-items:center;gap:8px;font:600 11px var(--mono);letter-spacing:.1em;border:1px solid var(--line-hi);padding:7px 12px;background:#101a1f}
+html[data-theme="light"] .chip{background:#fdf1d6}
+.theme-toggle{width:36px;height:36px;border:1px solid var(--line-hi);background:#101a1f;color:var(--dim);cursor:pointer;font-size:14px;transition:.15s}
+html[data-theme="light"] .theme-toggle{background:#fdf1d6}
+.theme-toggle:hover{color:var(--amber);border-color:var(--amber)}
 .deck{max-width:1440px;margin:0 auto;padding:0 26px 40px}
 .credit{margin-top:34px;text-align:center;font:500 10px var(--mono);letter-spacing:.24em;color:var(--faint)}
 .credit span{color:var(--amber)}
@@ -221,8 +267,9 @@ body{background:var(--ink);color:var(--text);font-family:var(--body);font-size:1
 .panel-title{font:600 12px var(--disp);letter-spacing:.22em}
 .panel-title::before{content:"\25AE ";color:var(--amber)}
 .panel-tools{display:flex;gap:8px;align-items:center}
-.config-row{display:flex;gap:8px;padding:14px 16px;align-items:center}
-.config-row .field-in{flex:1}
+.config-row{display:flex;gap:8px;padding:14px 16px;align-items:center;flex-wrap:wrap}
+.config-row .field-in{flex:1;min-width:160px}
+.config-row label.check{display:flex;align-items:center;gap:6px;font:500 10.5px var(--mono);color:var(--dim);white-space:nowrap}
 .config-hint{padding:0 16px 12px;margin:0}
 .table-wrap{overflow-x:auto}
 .tbl{width:100%;border-collapse:collapse}
@@ -234,6 +281,7 @@ tr.flash{animation:rowflash 1s ease-out}
 @keyframes rowflash{0%{background:rgba(255,180,84,.22)}100%{background:transparent}}
 .row-empty{color:var(--faint);font:400 12px var(--mono);text-align:center;padding:22px!important;letter-spacing:.1em;list-style:none}
 .u-name{font:600 13.5px var(--mono)}
+.u-target{font:400 10.5px var(--mono);color:var(--faint);display:block;margin-top:2px}
 .pill{display:inline-flex;align-items:center;gap:6px;font:600 10px var(--mono);letter-spacing:.12em;padding:4px 9px;border:1px solid var(--line)}
 .pill-ok{color:var(--green);border-color:rgba(67,217,163,.35);background:rgba(67,217,163,.07)}
 .pill-off{color:var(--faint)}
@@ -241,6 +289,7 @@ tr.flash{animation:rowflash 1s ease-out}
 .meter i{position:absolute;inset:0;transform-origin:left;background:var(--green);transition:transform .4s}
 .meter.hot i{background:var(--amber)}.meter.full i{background:var(--red)}
 .asl{display:inline-flex;align-items:center;border:1px solid var(--line-hi);background:#0d1519}
+html[data-theme="light"] .asl{background:#fdf1d6}
 .asl button{width:27px;height:27px;background:none;border:0;color:var(--dim);font:600 15px var(--mono);cursor:pointer;transition:.15s}
 .asl button:hover{color:var(--amber);background:rgba(255,180,84,.1)}
 .asl output{min-width:36px;text-align:center;font:600 13px var(--mono)}
@@ -248,19 +297,24 @@ tr.flash{animation:rowflash 1s ease-out}
 .sess-list li{display:flex;align-items:center;gap:10px;padding:10px 14px;border-bottom:1px solid rgba(30,44,51,.55);font:400 12px var(--mono);animation:slidein .3s both}
 @keyframes slidein{from{opacity:0;transform:translateX(9px)}}
 .s-user{font-weight:600}
+.s-label{color:var(--cyan);font-size:10.5px;border:1px solid rgba(91,200,255,.3);padding:1px 6px;cursor:pointer}
+.s-label:hover{border-color:var(--cyan);color:#fff}
 .you{font-style:normal;color:var(--amber);font-size:9px;letter-spacing:.14em;border:1px solid rgba(255,180,84,.4);padding:1px 5px}
 .s-meta{flex:1;color:var(--faint);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .s-meta .ago{font-style:normal;margin-left:6px;color:var(--dim)}
 .s-role{font-size:9.5px;letter-spacing:.14em;color:var(--cyan);border:1px solid rgba(91,200,255,.3);padding:2px 6px}
+.log-tools{display:flex;gap:6px;padding:10px 14px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+.log-tools select,.log-tools input{background:#0b1216;border:1px solid var(--line);color:var(--text);font:500 11px var(--mono);padding:6px 8px}
+html[data-theme="light"] .log-tools select,html[data-theme="light"] .log-tools input{background:#fffdf5}
 .log-list{list-style:none;max-height:300px;overflow:auto}
 .log-list li{display:flex;gap:9px;align-items:baseline;padding:8px 14px;border-bottom:1px solid rgba(30,44,51,.5);font-size:12.5px}
 .log-list li.fresh{animation:slidein .35s both}
 .log-txt{color:var(--dim);flex:1;line-height:1.45}
 .log-ts{font:400 10.5px var(--mono);color:var(--faint);white-space:nowrap;font-style:normal}
 .k-auth{background:var(--green)}
-.k-auth_fail,.k-user_delete,.k-session_kill{background:var(--red)}
+.k-auth_fail,.k-user_delete,.k-session_kill,.k-ip_block,.k-rate_limit,.k-user_restrict{background:var(--red)}
 .k-as_block,.k-as_enforce,.k-lockout,.k-pass_reset{background:var(--amber)}
-.k-user_create,.k-user_edit,.k-cred_upgrade,.k-config{background:var(--cyan)}
+.k-user_create,.k-user_edit,.k-cred_upgrade,.k-config,.k-label{background:var(--cyan)}
 .modal-backdrop{position:fixed;inset:0;background:rgba(5,9,11,.74);display:flex;align-items:center;justify-content:center;z-index:60;opacity:0;transition:opacity .2s}
 .modal-backdrop.open{opacity:1}
 .modal{width:min(440px,92vw);background:var(--panel);border:1px solid var(--line-hi);box-shadow:0 30px 80px -20px #000,0 0 0 1px rgba(91,200,255,.07);transform:translateY(12px);transition:transform .22s}
@@ -288,9 +342,28 @@ GUARD_JS = r"""
 const $=s=>document.querySelector(s);
 const $$=s=>[...document.querySelectorAll(s)];
 const CSRF=document.querySelector('meta[name="csrf-token"]')?.content||"";
+
+// ---- theme toggle (persisted client-side; a plain web app, not an artifact) ----
+(function initTheme(){
+  const saved=localStorage.getItem("sg-theme");
+  const theme=saved||"dark";
+  document.documentElement.setAttribute("data-theme",theme);
+  document.addEventListener("DOMContentLoaded",()=>{
+    const btns=$$("[data-theme-toggle]");
+    btns.forEach(b=>b.textContent=theme==="light"?"\u263E":"\u2600");
+    btns.forEach(b=>b.addEventListener("click",()=>{
+      const cur=document.documentElement.getAttribute("data-theme")==="light"?"dark":"light";
+      document.documentElement.setAttribute("data-theme",cur);
+      localStorage.setItem("sg-theme",cur);
+      btns.forEach(x=>x.textContent=cur==="light"?"\u263E":"\u2600");
+    }));
+  });
+})();
+
 async function api(path,opts={}){
   const res=await fetch(path,{headers:{"Content-Type":"application/json","X-CSRF-Token":CSRF},...opts});
   if(res.status===401){location.href="/auth/login";throw new Error("session expired")}
+  if(res.status===429){throw new Error("rate limited \u2014 slow down")}
   const data=await res.json().catch(()=>({}));
   if(!res.ok||!data.ok)throw new Error(data.error||res.statusText);
   return data;
@@ -333,7 +406,8 @@ if(document.body.classList.contains("console")){
     if(!rows.length){body.innerHTML='<tr><td colspan="5" class="row-empty">no users \u2014 add one or edit users.txt</td></tr>';return}
     body.innerHTML=rows.map(u=>`
       <tr data-user="${esc(u.username)}">
-        <td><span class="u-name">@${esc(u.username)}</span></td>
+        <td><span class="u-name">@${esc(u.username)}</span>
+            <span class="u-target">${u.target?("\u2192 "+esc(u.target)):"\u2192 default target"}${(u.ip_allow||u.ua_allow)?' <b class="s-role" title="login restricted by IP/device">\u{1F512} RESTRICTED</b>':""}</span></td>
         <td>${u.enabled?'<span class="pill pill-ok"><b class="dot dot-live"></b>ACTIVE</span>':'<span class="pill pill-off">OFF</span>'}</td>
         <td><span class="mono ${u.at_limit?"warn":""}">${u.sessions}/${u.as}</span>
             <div class="meter ${u.sessions>=u.as?"full":u.sessions>=u.as-1?"hot":""}">
@@ -345,7 +419,7 @@ if(document.body.classList.contains("console")){
             </div></td>
         <td class="ta-r">
           <button class="btn-ico" data-act="pass" title="reset passkey">\u27F3</button>
-          <button class="btn-ico" data-act="edit" title="edit (AS / enable)">\u270E</button>
+          <button class="btn-ico" data-act="edit" title="edit (AS / target / TTL / enable)">\u270E</button>
           <button class="btn-ico" data-act="kick" title="force logout all sessions" ${u.sessions?"":"disabled"}>\u23FB</button>
           <button class="btn-ico btn-ico-danger" data-act="del" title="delete user">\u2715</button>
         </td>
@@ -389,7 +463,7 @@ if(document.body.classList.contains("console")){
   async function loadSessions(){
     const d=await api("/api/sessions");
     $("#sess-count").textContent=d.sessions.length+" tracked";
-    const sig=JSON.stringify(d.sessions.map(s=>[s.id,s.user,s.last_seen,s.current]));
+    const sig=JSON.stringify(d.sessions.map(s=>[s.id,s.user,s.last_seen,s.current,s.label]));
     if(sig===sessSig)return;
     sessSig=sig;
     const list=$("#sess-list");
@@ -398,6 +472,7 @@ if(document.body.classList.contains("console")){
       <li data-token="${esc(s.id)}">
         <b class="dot ${s.role==="admin"?"dot-admin":"dot-live"}"></b>
         <span class="s-user">${esc(s.user)}${s.current?' <em class="you">YOU</em>':""}</span>
+        <span class="s-label" data-relabel title="click to rename device">${esc(s.label||"unlabeled")}</span>
         <span class="s-meta">${esc(s.ip)} \u00B7 <i data-ago="${s.last_seen}"></i></span>
         <span class="s-role">${s.role}</span>
         <button class="btn-ico btn-ico-danger" data-kill title="terminate session">\u23FB</button>
@@ -405,26 +480,45 @@ if(document.body.classList.contains("console")){
     refreshTimes();
   }
   $("#sess-list").addEventListener("click",async e=>{
-    const btn=e.target.closest("[data-kill]");if(!btn)return;
+    const killBtn=e.target.closest("[data-kill]");
+    const labelEl=e.target.closest("[data-relabel]");
+    const li=e.target.closest("li");if(!li)return;
+    const tok=li.dataset.token;
     try{
-      await api(`/api/sessions/${btn.closest("li").dataset.token}/kill`,{method:"POST"});
-      toast("session terminated","warn");
-      loadSessions();loadUsers();loadStats();
+      if(killBtn){
+        await api(`/api/sessions/${tok}/kill`,{method:"POST"});
+        toast("session terminated","warn");
+        loadSessions();loadUsers();loadStats();
+      }else if(labelEl){
+        const cur=labelEl.textContent;
+        const next=prompt("Device label:",cur==="unlabeled"?"":cur);
+        if(next===null)return;
+        await api(`/api/sessions/${tok}/label`,{method:"POST",body:JSON.stringify({label:next})});
+        toast("device label updated","ok");
+        loadSessions();
+      }
     }catch(err){toast(err.message,"err")}
   });
   async function loadEvents(){
-    const d=await api("/api/events");
-    const sig=d.events.length+":"+(d.events[0]?.ts||0);
+    const kind=$("#log-kind")?.value||"";
+    const user=$("#log-user")?.value.trim()||"";
+    const qs=new URLSearchParams();
+    if(kind)qs.set("kind",kind);
+    if(user)qs.set("user",user);
+    const d=await api("/api/events?"+qs.toString());
+    const sig=d.events.length+":"+(d.events[0]?.ts||0)+":"+kind+":"+user;
     if(sig===evSig)return;
-    const known=evSig!=="";evSig=sig;
+    const known=evSig!==""&&evSig.split(":")[2]===kind&&evSig.split(":")[3]===user;evSig=sig;
     $("#log-list").innerHTML=d.events.map((ev,i)=>`
       <li class="${known&&i<2?"fresh":""}">
         <b class="dot k-${esc(ev.kind)}"></b>
         <span class="log-txt">${esc(ev.detail)}</span>
         <i class="log-ts" data-ago="${ev.ts}"></i>
-      </li>`).join("")||'<li class="row-empty">log empty</li>';
+      </li>`).join("")||'<li class="row-empty">no matching events</li>';
     refreshTimes();
   }
+  $("#log-kind")?.addEventListener("change",()=>{evSig="";loadEvents()});
+  $("#log-user")?.addEventListener("input",()=>{evSig="";loadEvents()});
   const btnSave=$("#btn-save-target");
   if(btnSave)btnSave.onclick=async()=>{
     const t=$("#cfg-target").value.trim();
@@ -435,15 +529,33 @@ if(document.body.classList.contains("console")){
       const st=$("#cfg-status");if(st){st.textContent="SAVED";setTimeout(()=>st.textContent="",2500)}
     }catch(err){toast(err.message,"err")}
   };
+  const btnSaveSec=$("#btn-save-security");
+  if(btnSaveSec)btnSaveSec.onclick=async()=>{
+    try{
+      await api("/api/config",{method:"POST",body:JSON.stringify({
+        session_ttl_hours:+$("#cfg-ttl").value||12,
+        rate_limit_max:+$("#cfg-rl-max").value||240,
+        rate_limit_window:+$("#cfg-rl-window").value||60,
+        ip_allow:$("#cfg-ip-allow").value.trim(),
+        ip_deny:$("#cfg-ip-deny").value.trim(),
+      })});
+      toast("security settings saved","ok");
+    }catch(err){toast(err.message,"err")}
+  };
   function openModal(id){const m=$(id);m.hidden=false;requestAnimationFrame(()=>m.classList.add("open"))}
   function closeModal(m){m.classList.remove("open");setTimeout(()=>m.hidden=true,200)}
+  $("#f-restrict").addEventListener("change",()=>{
+    $("#restrictfields").hidden=!$("#f-restrict").checked;
+    if(!$("#f-restrict").checked){$("#f-ip").value="";$("#f-ua").value=""}
+  });
   $$(".modal-backdrop").forEach(m=>
     m.addEventListener("click",e=>{if(e.target===m||e.target.closest("[data-close]"))closeModal(m)}));
   $("#btn-new-user").onclick=()=>{
     editing=null;
     $("#modal-user-title").textContent="NEW USER";
     $("#f-username").disabled=false;$("#f-username").value="";
-    $("#f-pass").value="";$("#f-as").value=1;
+    $("#f-pass").value="";$("#f-as").value=1;$("#f-target").value="";$("#f-ttl").value="";
+    $("#f-ip").value="";$("#f-ua").value="";$("#f-restrict").checked=false;$("#restrictfields").hidden=true;
     $("#passrow").hidden=false;$("#enablerow").hidden=true;
     openModal("#modal-user");
   };
@@ -453,17 +565,30 @@ if(document.body.classList.contains("console")){
     $("#modal-user-title").textContent="EDIT \u2014 @"+user;
     $("#f-username").value=user;$("#f-username").disabled=true;
     $("#f-as").value=u.as;$("#f-enabled").checked=u.enabled;
+    $("#f-target").value=u.target||"";$("#f-ttl").value=u.ttl||"";
+    $("#f-ip").value=u.ip_allow||"";$("#f-ua").value=u.ua_allow||"";
+    const restricted=!!(u.ip_allow||u.ua_allow);
+    $("#f-restrict").checked=restricted;$("#restrictfields").hidden=!restricted;
     $("#passrow").hidden=true;$("#enablerow").hidden=false;
     openModal("#modal-user");
   }
   $("#form-user").onsubmit=async e=>{
     e.preventDefault();
     try{
+      const restrict=$("#f-restrict").checked;
+      const ip_allow=restrict?$("#f-ip").value.trim():"";
+      const ua_allow=restrict?$("#f-ua").value.trim():"";
       if(editing){
-        await api(`/api/users/${editing}`,{method:"PATCH",body:JSON.stringify({as:+$("#f-as").value||1,enabled:$("#f-enabled").checked})});
+        await api(`/api/users/${editing}`,{method:"PATCH",body:JSON.stringify({
+          as:+$("#f-as").value||1,enabled:$("#f-enabled").checked,
+          target:$("#f-target").value.trim(),ttl:$("#f-ttl").value?+$("#f-ttl").value:null,
+          ip_allow,ua_allow})});
         toast("user updated","ok");
       }else{
-        await api("/api/users",{method:"POST",body:JSON.stringify({username:$("#f-username").value.trim(),password:$("#f-pass").value,as:+$("#f-as").value||1})});
+        await api("/api/users",{method:"POST",body:JSON.stringify({
+          username:$("#f-username").value.trim(),password:$("#f-pass").value,as:+$("#f-as").value||1,
+          target:$("#f-target").value.trim(),ttl:$("#f-ttl").value?+$("#f-ttl").value:null,
+          ip_allow,ua_allow})});
         toast("user provisioned \u2192 users.txt","ok");
       }
       closeModal($("#modal-user"));loadUsers();loadStats();
@@ -484,6 +609,9 @@ if(document.body.classList.contains("console")){
       closeModal($("#modal-pass"));loadSessions();loadUsers();
     }catch(err){toast(err.message,"err")}
   };
+  const btnExport=$("#btn-export-csv"),btnExportJson=$("#btn-export-json");
+  if(btnExport)btnExport.onclick=()=>{location.href="/api/events/export?format=csv"};
+  if(btnExportJson)btnExportJson.onclick=()=>{location.href="/api/events/export?format=json"};
   (async function boot(){
     await Promise.all([loadStats(),loadUsers(),loadSessions(),loadEvents()]);
     setInterval(()=>{loadStats();loadUsers();loadSessions()},5000);
@@ -518,10 +646,11 @@ TPL_LOGIN = _HTML_HEAD + r"""
     <p class="gate-sub">AUTH GATEWAY &middot; SESSION ENFORCEMENT &middot; AS LIMITS</p>
     <ul class="gate-status">
       <li><span>GATEWAY STATE</span><b class="ok">ARMED <i class="dot dot-live"></i></b></li>
-      <li><span>CREDENTIAL STORE</span><b>users.txt &middot; PBKDF2-SHA256</b></li>
-      <li><span>GUARDS</span><b class="ok">CSRF &middot; LOCKOUT &middot; AS</b></li>
+      <li><span>CREDENTIAL STORE</span><b>users.txt &middot; scrypt</b></li>
+      <li><span>GUARDS</span><b class="ok">CSRF &middot; LOCKOUT &middot; AS &middot; RATE-LIMIT &middot; IP RULES</b></li>
       <li><span>GATEWAY TIME</span><b id="gate-clock">--:--:--</b></li>
     </ul>
+    <button class="btn theme-toggle" data-theme-toggle style="margin-top:20px" title="toggle light/dark"></button>
   </section>
   <section class="gate-console {{ 'shake' if shake else '' }}">
     <header class="console-bar">
@@ -558,6 +687,7 @@ TPL_ADMIN = _HTML_HEAD + r"""
   <div class="top-right">
     <span class="clock" id="clock">--:--:-- UTC</span>
     <span class="chip"><b class="dot dot-live"></b>{{ admin }}</span>
+    <button class="theme-toggle" data-theme-toggle title="toggle light/dark"></button>
     <form method="post" action="/auth/logout" class="inline">
       <input type="hidden" name="csrf_token" value="{{ csrf }}">
       <button class="btn" type="submit">LOG OUT</button>
@@ -577,13 +707,34 @@ TPL_ADMIN = _HTML_HEAD + r"""
       <span class="dim mono" id="cfg-status"></span>
     </header>
     {% if not backend %}
-    <div class="gate-error" style="margin:14px 16px 0">&#9650; NOT CONFIGURED &mdash; the gateway will refuse to proxy any traffic until you set a target below.</div>
+    <div class="gate-error" style="margin:14px 16px 0">&#9650; NOT CONFIGURED &mdash; the gateway will refuse to proxy any traffic (for users without a per-account TARGET) until you set a default target below.</div>
     {% endif %}
     <div class="config-row">
-      <input class="field-in" id="cfg-target" value="{{ backend }}" spellcheck="false" placeholder="e.g. http://127.0.0.1:8080 &mdash; wherever your tool actually listens">
+      <input class="field-in" id="cfg-target" value="{{ backend }}" spellcheck="false" placeholder="e.g. http://127.0.0.1:8080 &mdash; default backend for users with no TARGET override">
       <button class="btn btn-amber" id="btn-save-target">SAVE ROUTE</button>
     </div>
-    <p class="hint config-hint">Where authenticated traffic is forwarded. No default is set on purpose &mdash; point this at your tool yourself. Change live &mdash; no restart needed. Keep your tool bound to 127.0.0.1.</p>
+    <p class="hint config-hint">Default backend traffic is forwarded to. Any user can be routed elsewhere from the user editor (TARGET) &mdash; e.g. robby &rarr; :8080, bibi &rarr; :7070 &mdash; which overrides this default for that account only. Change live &mdash; no restart needed. Keep your tool(s) bound to 127.0.0.1.</p>
+  </section>
+  <section class="panel" style="margin-bottom:18px">
+    <header class="panel-head"><h2 class="panel-title">SECURITY</h2></header>
+    <div class="config-row">
+      <label class="field-key" style="margin:0">SESSION TTL (hrs)<br>
+        <input class="field-in field-sm" id="cfg-ttl" type="number" min="1" value="{{ ttl_hours }}"></label>
+      <label class="field-key" style="margin:0">RATE LIMIT (req)<br>
+        <input class="field-in field-sm" id="cfg-rl-max" type="number" min="3" value="{{ rl_max }}"></label>
+      <label class="field-key" style="margin:0">PER WINDOW (sec)<br>
+        <input class="field-in field-sm" id="cfg-rl-window" type="number" min="1" value="{{ rl_window }}"></label>
+    </div>
+    <div class="config-row">
+      <label class="field-key" style="margin:0;flex:1">IP ALLOWLIST (comma-sep IPs/CIDRs, blank = allow all)<br>
+        <input class="field-in" id="cfg-ip-allow" value="{{ ip_allow }}" placeholder="e.g. 10.0.0.0/8, 203.0.113.4"></label>
+    </div>
+    <div class="config-row">
+      <label class="field-key" style="margin:0;flex:1">IP DENYLIST (comma-sep IPs/CIDRs)<br>
+        <input class="field-in" id="cfg-ip-deny" value="{{ ip_deny }}" placeholder="e.g. 198.51.100.0/24"></label>
+      <button class="btn btn-amber" id="btn-save-security">SAVE SECURITY</button>
+    </div>
+    <p class="hint config-hint">Per-user session TTL overrides (TTL:seconds) can be set in the user editor. Rate limiting and IP rules apply gateway-wide, including the admin API.</p>
   </section>
   <div class="grid">
     <section class="panel">
@@ -596,7 +747,7 @@ TPL_ADMIN = _HTML_HEAD + r"""
       </header>
       <div class="table-wrap">
         <table class="tbl">
-          <thead><tr><th>USER</th><th>STATUS</th><th>SESSIONS</th><th>AS LIMIT</th><th class="ta-r">ACTIONS</th></tr></thead>
+          <thead><tr><th>USER / TARGET</th><th>STATUS</th><th>SESSIONS</th><th>AS LIMIT</th><th class="ta-r">ACTIONS</th></tr></thead>
           <tbody id="users-body"><tr><td colspan="5" class="row-empty">loading registry&hellip;</td></tr></tbody>
         </table>
       </div>
@@ -609,6 +760,30 @@ TPL_ADMIN = _HTML_HEAD + r"""
       </section>
       <section class="panel">
         <header class="panel-head"><h2 class="panel-title">ACTIVITY LOG</h2><b class="dot dot-live"></b></header>
+        <div class="log-tools">
+          <select id="log-kind">
+            <option value="">all kinds</option>
+            <option value="auth">auth</option>
+            <option value="auth_fail">auth_fail</option>
+            <option value="lockout">lockout</option>
+            <option value="as_block">as_block</option>
+            <option value="as_enforce">as_enforce</option>
+            <option value="session_kill">session_kill</option>
+            <option value="user_create">user_create</option>
+            <option value="user_edit">user_edit</option>
+            <option value="user_delete">user_delete</option>
+            <option value="pass_reset">pass_reset</option>
+            <option value="cred_upgrade">cred_upgrade</option>
+            <option value="config">config</option>
+            <option value="label">label</option>
+            <option value="ip_block">ip_block</option>
+            <option value="rate_limit">rate_limit</option>
+            <option value="user_restrict">user_restrict</option>
+          </select>
+          <input id="log-user" class="field-sm" placeholder="filter by user&hellip;" spellcheck="false">
+          <button class="btn" id="btn-export-csv" type="button">EXPORT CSV</button>
+          <button class="btn" id="btn-export-json" type="button">EXPORT JSON</button>
+        </div>
         <ul class="log-list" id="log-list"><li class="row-empty">log empty</li></ul>
       </section>
     </aside>
@@ -622,6 +797,14 @@ TPL_ADMIN = _HTML_HEAD + r"""
       <label class="field"><span class="field-key">USERNAME</span><input class="field-in" id="f-username" spellcheck="false"></label>
       <label class="field" id="passrow"><span class="field-key">PASSKEY (min 8)</span><input class="field-in" id="f-pass" type="password"></label>
       <label class="field"><span class="field-key">AS &mdash; ALLOWED SESSIONS</span><input class="field-in" id="f-as" type="number" min="1" max="50" value="1"></label>
+      <label class="field"><span class="field-key">TARGET OVERRIDE (blank = use default)</span><input class="field-in" id="f-target" spellcheck="false" placeholder="e.g. http://127.0.0.1:8080"></label>
+      <label class="field"><span class="field-key">SESSION TTL SECONDS (blank = default)</span><input class="field-in" id="f-ttl" type="number" min="60"></label>
+      <label class="field check"><input type="checkbox" id="f-restrict"><span>RESTRICT LOGIN TO SPECIFIC IP / DEVICE</span></label>
+      <div id="restrictfields" hidden>
+        <label class="field"><span class="field-key">ALLOWED IP(S) / CIDR (comma-sep, blank = any)</span><input class="field-in" id="f-ip" spellcheck="false" placeholder="e.g. 192.168.1.50, 10.0.0.0/24"></label>
+        <label class="field"><span class="field-key">ALLOWED BROWSER/DEVICE (comma-sep substrings, blank = any)</span><input class="field-in" id="f-ua" spellcheck="false" placeholder="e.g. iPhone, Chrome"></label>
+        <p class="hint">Only requests whose User-Agent contains one of these substrings are accepted &mdash; e.g. &quot;iPhone&quot; restricts to iOS Safari/Chrome on iPhone. Login AND every subsequent request are checked; a session is killed the moment IP or device stop matching.</p>
+      </div>
       <label class="field check" id="enablerow" hidden><input type="checkbox" id="f-enabled" checked><span>ACCOUNT ENABLED</span></label>
       <footer class="modal-foot"><button class="btn" type="button" data-close>CANCEL</button><button class="btn btn-amber" type="submit">COMMIT</button></footer>
     </form>
@@ -661,7 +844,7 @@ TPL_PORTAL = _HTML_HEAD + r"""
         {% for s in sessions %}
         <li>
           <b class="dot {{ 'dot-admin' if s.role == 'admin' else 'dot-live' }}"></b>
-          <span class="s-meta">{{ s.ip }} &middot; {{ s.ua or "unknown client" }}
+          <span class="s-meta">{{ s.label or "unlabeled" }} &middot; {{ s.ip }} &middot; {{ s.ua or "unknown client" }}
             <i class="ago" data-ago="{{ s.last_seen }}"></i></span>
           {% if s.current %}<em class="you">THIS DEVICE</em>{% endif %}
           <form method="post" class="inline">
@@ -673,6 +856,12 @@ TPL_PORTAL = _HTML_HEAD + r"""
         </li>
         {% endfor %}
       </ul>
+      <form method="post" class="config-row" style="padding:0 0 14px">
+        <input type="hidden" name="csrf_token" value="{{ csrf }}">
+        <input type="hidden" name="action" value="relabel">
+        <input class="field-in" name="label" placeholder="label this device&hellip;" value="{{ current_label }}">
+        <button class="btn" type="submit">SAVE LABEL</button>
+      </form>
       <div class="portal-actions">
         <a class="btn" href="/">&larr; BACK TO TOOL</a>
         <form method="post" class="inline">
@@ -721,6 +910,22 @@ TPL_NOTARGET = _HTML_HEAD + r"""
 </main>
 """ + _HTML_FOOT
 
+TPL_BLOCKED = _HTML_HEAD + r"""
+<main class="gate-wrap solo">
+  <section class="gate-console">
+    <header class="console-bar">
+      <span class="bar-dots"><i></i><i></i><i></i></span>
+      <span class="bar-title">SESSIONGUARD &middot; ACCESS BLOCKED</span>
+    </header>
+    <div class="console-body center">
+      <p class="err-code">{{ code }}</p>
+      <p class="err-msg">{{ msg }}</p>
+      <p class="hint">If you believe this is a mistake, contact the administrator.</p>
+    </div>
+  </section>
+</main>
+""" + _HTML_FOOT
+
 # ═══════════════════════ STORAGE ═══════════════════════
 def _now(): return int(time.time())
 
@@ -736,9 +941,20 @@ def _save(p, obj):
     os.replace(tmp, p)
     os.chmod(p, 0o600)
 
-# ═══════════════════════ GATEWAY CONFIG ═══════════════════════
+# ═══════════════════════ GATEWAY / SECURITY CONFIG ═══════════════════════
+DEFAULT_CONFIG = {
+    "target": "",
+    "session_ttl_hours": DEFAULT_SESSION_TTL // 3600,
+    "rate_limit_max": RATE_LIMIT_MAX,
+    "rate_limit_window": RATE_LIMIT_WINDOW,
+    "ip_allow": "",   # comma-separated IPs/CIDRs; blank = allow all
+    "ip_deny": "",    # comma-separated IPs/CIDRs
+}
+
 def load_config():
-    return _load(CONFIG_DB, {"target": ""})
+    cfg = dict(DEFAULT_CONFIG)
+    cfg.update(_load(CONFIG_DB, {}))
+    return cfg
 
 def save_config(cfg):
     _save(CONFIG_DB, cfg)
@@ -746,19 +962,134 @@ def save_config(cfg):
 def get_target():
     return (load_config().get("target") or "").strip()
 
-# ═══════════════════════ CRYPTO ═══════════════════════
-def hash_password(pw, salt=None):
-    salt = salt or secrets.token_hex(16)
-    dk = hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt), ROUNDS)
-    return f"{salt}${dk.hex()}"
+def get_session_ttl():
+    hrs = load_config().get("session_ttl_hours", DEFAULT_SESSION_TTL // 3600)
+    try:
+        return max(60, int(float(hrs) * 3600))
+    except (TypeError, ValueError):
+        return DEFAULT_SESSION_TTL
 
-def verify_password(pw, stored):
+def get_rate_limit():
+    cfg = load_config()
+    try:
+        return max(3, int(cfg.get("rate_limit_max", RATE_LIMIT_MAX))), \
+               max(1, int(cfg.get("rate_limit_window", RATE_LIMIT_WINDOW)))
+    except (TypeError, ValueError):
+        return RATE_LIMIT_MAX, RATE_LIMIT_WINDOW
+
+def _parse_ip_list(raw):
+    nets = []
+    for tok in (raw or "").split(","):
+        tok = tok.strip()
+        if not tok: continue
+        try:
+            nets.append(ipaddress.ip_network(tok, strict=False))
+        except ValueError:
+            pass
+    return nets
+
+def ip_allowed(ip):
+    cfg = load_config()
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return True  # can't parse -> don't block on our own confusion
+    deny = _parse_ip_list(cfg.get("ip_deny", ""))
+    if any(addr in n for n in deny):
+        return False
+    allow = _parse_ip_list(cfg.get("ip_allow", ""))
+    if allow and not any(addr in n for n in allow):
+        return False
+    return True
+
+def _validate_ip_rule(raw):
+    """Validates a comma-separated IP/CIDR list for the per-user IP field.
+    Returns (cleaned_string, error_message_or_None)."""
+    raw = str(raw or "").strip()[:500]
+    if not raw:
+        return "", None
+    for tok in raw.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            ipaddress.ip_network(tok, strict=False)
+        except ValueError:
+            return "", f"invalid IP/CIDR: '{tok}'"
+    return raw, None
+
+def user_access_allowed(u, ip, ua):
+    """Per-account IP / User-Agent restriction, set via IP:/UA: tokens in
+    users.txt. Empty field = that dimension isn't restricted for this user.
+    Returns (ok, reason) where reason is only meaningful when ok is False."""
+    if not u:
+        return True, ""
+    ip_rule = (u.get("ip_allow") or "").strip()
+    if ip_rule:
+        nets = _parse_ip_list(ip_rule)
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            return False, "ip"
+        if nets and not any(addr in n for n in nets):
+            return False, "ip"
+    ua_rule = (u.get("ua_allow") or "").strip()
+    if ua_rule:
+        needles = [t.strip().lower() for t in ua_rule.split(",") if t.strip()]
+        haystack = (ua or "").lower()
+        if needles and not any(n in haystack for n in needles):
+            return False, "ua"
+    return True, ""
+
+# ═══════════════════════ RATE LIMITING ═══════════════════════
+def rate_limited(key):
+    """Sliding-window check. Returns True if the caller should be blocked."""
+    limit, window = get_rate_limit()
+    now = time.time()
+    with _rl_lock:
+        hits = _rl_hits.setdefault(key, [])
+        cutoff = now - window
+        while hits and hits[0] < cutoff:
+            hits.pop(0)
+        if len(hits) >= limit:
+            return True
+        hits.append(now)
+        return False
+
+# ═══════════════════════ CRYPTO ═══════════════════════
+def hash_password(pw):
+    """Current default: scrypt. Format: scrypt$N$r$p$salt_hex$hash_hex"""
+    salt = secrets.token_bytes(16)
+    dk = hashlib.scrypt(pw.encode(), salt=salt, n=SCRYPT_N, r=SCRYPT_R, p=SCRYPT_P, dklen=64)
+    return f"scrypt${SCRYPT_N}${SCRYPT_R}${SCRYPT_P}${salt.hex()}${dk.hex()}"
+
+def _verify_scrypt(pw, stored):
+    try:
+        _, n, r, p, salt_hex, hash_hex = stored.split("$")
+        dk = hashlib.scrypt(pw.encode(), salt=bytes.fromhex(salt_hex),
+                            n=int(n), r=int(r), p=int(p), dklen=len(hash_hex) // 2)
+        return hmac.compare_digest(dk.hex(), hash_hex)
+    except (ValueError, TypeError):
+        return False
+
+def _verify_pbkdf2(pw, stored):
     try:
         salt, expected = stored.split("$", 1)
-        dk = hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt), ROUNDS)
+        dk = hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt), PBKDF2_ROUNDS)
         return hmac.compare_digest(dk.hex(), expected)
     except (ValueError, TypeError):
         return False
+
+def verify_password(pw, stored):
+    """Verifies against current scrypt format or legacy PBKDF2 format."""
+    if SCRYPT_HASH_RE.match(stored):
+        return _verify_scrypt(pw, stored)
+    if PBKDF2_HASH_RE.match(stored):
+        return _verify_pbkdf2(pw, stored)
+    return False
+
+def is_legacy_hash(stored):
+    return bool(PBKDF2_HASH_RE.match(stored))
 
 def read_admin_record():
     if not ADMIN_AUTH.exists(): return None, None
@@ -784,15 +1115,24 @@ def load_users():
         users[m.group(1).lower()] = {
             "cred": m.group(2),
             "as": max(1, min(50, int(m.group(3) or 1))),
-            "enabled": m.group(4) is None,
+            "target": (m.group(4) or "").strip(),
+            "ttl": int(m.group(5)) if m.group(5) else None,
+            "ip_allow": (m.group(6) or "").strip(),
+            "ua_allow": (m.group(7) or "").strip(),
+            "enabled": m.group(8) is None,
         }
     return users
 
 def save_users(users):
-    lines = ["# SessionGuard users — user:credential AS:<allowed sessions> [OFF]",
-             "# plaintext credentials are auto-hashed on first login"]
+    lines = ["# SessionGuard users — user:credential AS:<allowed sessions> [TARGET:url] [TTL:seconds]",
+             "#                      [IP:a.b.c.d,cidr,...] [UA:substr,...] [OFF]",
+             "# plaintext / legacy PBKDF2 credentials are auto-upgraded to scrypt on first login"]
     for name, u in users.items():
         line = f"{name}:{u['cred']} AS:{u['as']}"
+        if u.get("target"): line += f" TARGET:{u['target']}"
+        if u.get("ttl"): line += f" TTL:{u['ttl']}"
+        if u.get("ip_allow"): line += f" IP:{u['ip_allow']}"
+        if u.get("ua_allow"): line += f" UA:{u['ua_allow']}"
         if not u["enabled"]: line += " OFF"
         lines.append(line)
     tmp = USERS_TXT.with_suffix(".tmp")
@@ -803,20 +1143,38 @@ def save_users(users):
 def verify_user(name, pw, users):
     u = users.get(name)
     if not u: return False
-    if CRED_HASH_RE.match(u["cred"]):
-        return verify_password(pw, u["cred"])
-    if hmac.compare_digest(pw, u["cred"]):
+    cred = u["cred"]
+    if SCRYPT_HASH_RE.match(cred) or PBKDF2_HASH_RE.match(cred):
+        ok = verify_password(pw, cred)
+        if ok and is_legacy_hash(cred):
+            with _lock:
+                fresh = load_users()
+                if name in fresh:
+                    fresh[name]["cred"] = hash_password(pw)
+                    save_users(fresh)
+            log_event("cred_upgrade", f"'{name}' PBKDF2 credential upgraded to scrypt on login")
+        return ok
+    # plaintext line in users.txt
+    if hmac.compare_digest(pw, cred):
         with _lock:
             fresh = load_users()
             if name in fresh:
                 fresh[name]["cred"] = hash_password(pw)
                 save_users(fresh)
-        log_event("cred_upgrade", f"'{name}' plaintext credential auto-hashed on login")
+        log_event("cred_upgrade", f"'{name}' plaintext credential auto-hashed (scrypt) on login")
         return True
     return False
 
 # ═══════════════════════ SESSIONS ═══════════════════════
 def load_sessions(): return _load(SESSIONS_DB, {})
+
+def _auto_label(ua):
+    ua = ua or ""
+    for token, label in (("iPhone", "iPhone"), ("iPad", "iPad"), ("Android", "Android"),
+                         ("Macintosh", "Mac"), ("Windows", "Windows"), ("Linux", "Linux")):
+        if token in ua:
+            return label
+    return "unknown device"
 
 def create_session(user, role, ip, ua):
     with _lock:
@@ -824,7 +1182,7 @@ def create_session(user, role, ip, ua):
         token = secrets.token_urlsafe(32)
         sessions[token] = {"user": user, "role": role, "csrf": secrets.token_urlsafe(24),
                            "created": _now(), "last_seen": _now(),
-                           "ip": ip, "ua": (ua or "")[:110]}
+                           "ip": ip, "ua": (ua or "")[:110], "label": _auto_label(ua)}
         _save(SESSIONS_DB, sessions)
     return token
 
@@ -860,11 +1218,20 @@ def evict_excess(user, limit):
             log_event("as_enforce", f"AS enforced for '{user}': {killed} oldest session(s) evicted")
     return killed
 
+def _effective_ttl(username, role):
+    if role != "user":
+        return get_session_ttl()
+    u = load_users().get(username)
+    if u and u.get("ttl"):
+        return max(60, u["ttl"])
+    return get_session_ttl()
+
 def purge_expired():
-    cutoff = _now() - SESSION_TTL
+    now = _now()
     with _lock:
         s = load_sessions()
-        dead = [t for t, v in s.items() if v["last_seen"] < cutoff]
+        dead = [t for t, v in s.items()
+                if v["last_seen"] < now - _effective_ttl(v["user"], v["role"])]
         for t in dead: del s[t]
         if dead: _save(SESSIONS_DB, s)
 
@@ -873,7 +1240,7 @@ def get_session():
     if not tok: return None, None
     s = load_sessions().get(tok)
     if not s: return None, None
-    if s["last_seen"] < _now() - SESSION_TTL:
+    if s["last_seen"] < _now() - _effective_ttl(s["user"], s["role"]):
         kill_token(tok)
         return None, None
     return tok, s
@@ -891,25 +1258,33 @@ def log_event(kind, detail):
     with _lock:
         ev = _load(EVENTS_DB, [])
         ev.insert(0, {"ts": _now(), "kind": kind, "detail": detail})
-        _save(EVENTS_DB, ev[:100])
+        _save(EVENTS_DB, ev[:500])
+
+def query_events(kind=None, user=None, since=None, limit=100):
+    events = _load(EVENTS_DB, [])
+    if kind:
+        events = [e for e in events if e["kind"] == kind]
+    if user:
+        u = user.lower()
+        events = [e for e in events if u in e["detail"].lower()]
+    if since:
+        events = [e for e in events if e["ts"] >= since]
+    return events[:limit]
 
 # ═══════════════════════ SERVER-SIDE LOGIN CSRF TOKENS ═══════════════════════
 def _purge_csrf_tokens():
-    """Remove expired single-use CSRF tokens from the in-memory store."""
     now = _now()
     expired = [k for k, exp in _csrf_tokens.items() if exp < now]
     for k in expired:
         del _csrf_tokens[k]
 
 def issue_login_csrf():
-    """Generate a single-use CSRF token for the login form, stored server-side."""
     _purge_csrf_tokens()
     token = secrets.token_urlsafe(32)
     _csrf_tokens[token] = _now() + CSRF_TOKEN_TTL
     return token
 
 def consume_login_csrf(token):
-    """Validate and consume a single-use login CSRF token. Returns True if valid."""
     if not token:
         return False
     exp = _csrf_tokens.pop(token, None)
@@ -927,10 +1302,10 @@ def page(tpl, status=200, **ctx):
                          "Cache-Control": "no-store"})
     return resp
 
-def set_sid(resp, token):
+def set_sid(resp, token, ttl):
     secure = request.headers.get("X-Forwarded-Proto", "") == "https"
     resp.set_cookie(SID_COOKIE, token, httponly=True, samesite="Lax",
-                    max_age=SESSION_TTL, secure=secure, path="/")
+                    max_age=ttl, secure=secure, path="/")
     return resp
 
 def safe_next(val):
@@ -948,8 +1323,6 @@ def record_fail(key):
     return c
 
 def csrf_ok(sess):
-    """Validate CSRF for authenticated (post-login) forms.
-    Checks the session-bound CSRF token submitted via form field or header."""
     tok = request.form.get("csrf_token", "") or request.headers.get("X-CSRF-Token", "")
     if not tok: return False
     return bool(sess) and hmac.compare_digest(tok, sess.get("csrf", ""))
@@ -975,6 +1348,24 @@ def admin_api(fn):
         return fn(*a, **k)
     return admin_required(w)
 
+@app.before_request
+def _global_guards():
+    if request.path.startswith("/sg-static/"):
+        return None
+    ip = request.remote_addr or "0.0.0.0"
+    if not ip_allowed(ip):
+        log_event("ip_block", f"blocked request from {ip} ({request.path})")
+        return page(TPL_BLOCKED, status=403, title="SessionGuard // BLOCKED",
+                    bodyclass="gate", code="403", msg="IP ADDRESS BLOCKED")
+    rl_key = f"ip:{ip}"
+    if rate_limited(rl_key):
+        log_event("rate_limit", f"rate limit hit for {ip} ({request.path})")
+        if request.path.startswith("/api/"):
+            return jsonify(ok=False, error="rate limited"), 429
+        return page(TPL_BLOCKED, status=429, title="SessionGuard // RATE LIMITED",
+                    bodyclass="gate", code="429", msg="TOO MANY REQUESTS — SLOW DOWN")
+    return None
+
 # ═══════════════════════ STATIC ASSETS ═══════════════════════
 @app.route("/sg-static/guard.css")
 def sg_css():
@@ -991,8 +1382,9 @@ def sg_js():
     return resp
 
 # ═══════════════════════ AUTH GATE ═══════════════════════
-ERR_MAP = {"disabled": "ACCOUNT DISABLED — contact administrator",
-           "expired":  "SESSION EXPIRED — authenticate again"}
+ERR_MAP = {"disabled":   "ACCOUNT DISABLED — contact administrator",
+           "expired":    "SESSION EXPIRED — authenticate again",
+           "restricted": "ACCESS RESTRICTED — this device or network isn't authorized for this account"}
 
 @app.route("/auth/login", methods=["GET", "POST"])
 def login():
@@ -1011,7 +1403,6 @@ def login():
     pw   = request.form.get("password", "")
     nxt  = safe_next(request.form.get("next"))
 
-    # Validate single-use server-side CSRF token
     submitted_csrf = request.form.get("csrf_token", "")
     if not consume_login_csrf(submitted_csrf):
         return _login_page("CSRF CHECK FAILED — reload the page and retry", nxt), 403
@@ -1023,8 +1414,12 @@ def login():
     admin_name, admin_rec = read_admin_record()
     if admin_rec and admin_name and hmac.compare_digest(name, admin_name) and verify_password(pw, admin_rec):
         _fails.pop(f"ip:{ip}", None)
+        if is_legacy_hash(admin_rec):
+            write_admin_record(admin_name, pw)
+            log_event("cred_upgrade", "admin PBKDF2 credential upgraded to scrypt on login")
+        ttl = _effective_ttl(name, "admin")
         resp = set_sid(make_response(redirect("/admin")),
-                       create_session(name, "admin", ip, request.user_agent.string))
+                       create_session(name, "admin", ip, request.user_agent.string), ttl)
         log_event("auth", f"admin '{name}' logged in from {ip}")
         return resp
 
@@ -1035,14 +1430,21 @@ def login():
         if u and u["enabled"] and verify_user(key, pw, users):
             _fails.pop(f"ip:{ip}", None)
             _fails.pop(f"u:{key}", None)
+            ok, reason = user_access_allowed(u, ip, request.user_agent.string)
+            if not ok:
+                log_event("user_restrict",
+                          f"'{key}' denied: {'IP' if reason=='ip' else 'User-Agent'} not on this "
+                          f"account's allowlist ({ip})")
+                return _login_page(ERR_MAP["restricted"], nxt), 403
             if count_sessions(key) >= u["as"]:
                 log_event("as_block", f"'{key}' denied: AS {u['as']} reached from {ip}")
                 return _login_page(
                     f"SESSION LIMIT REACHED — your account allows {u['as']} concurrent "
                     f"session(s) and all are in use. Log out from another device at "
                     f"/auth/portal or contact the administrator.", nxt), 403
+            ttl = _effective_ttl(key, "user")
             token = create_session(key, "user", ip, request.user_agent.string)
-            resp = set_sid(make_response(redirect(nxt)), token)
+            resp = set_sid(make_response(redirect(nxt)), token, ttl)
             log_event("auth", f"user '{key}' logged in from {ip}")
             return resp
 
@@ -1071,6 +1473,18 @@ def portal():
     tok, sess = get_session()
     if not sess:
         return redirect("/auth/login?next=/auth/portal")
+    if sess["role"] == "user":
+        u = load_users().get(sess["user"])
+        ok, reason = user_access_allowed(u, request.remote_addr or "", request.user_agent.string) if u else (False, "ip")
+        if not u or not ok:
+            kill_token(tok)
+            if u:
+                log_event("user_restrict",
+                          f"'{sess['user']}' session killed at portal: "
+                          f"{'IP' if reason=='ip' else 'User-Agent'} no longer matches allowlist")
+            resp = make_response(redirect("/auth/login?err=restricted"))
+            resp.delete_cookie(SID_COOKIE)
+            return resp
     if request.method == "POST":
         if not csrf_ok(sess):
             return page(TPL_PORTAL, title="SessionGuard // MY SESSIONS", bodyclass="gate",
@@ -1092,6 +1506,14 @@ def portal():
                     resp = make_response(redirect(url_for("login")))
                     resp.delete_cookie(SID_COOKIE)
                     return resp
+        if action == "relabel":
+            label = request.form.get("label", "")[:60].strip()
+            with _lock:
+                s = load_sessions()
+                if tok in s:
+                    s[tok]["label"] = label or _auto_label(s[tok].get("ua"))
+                    _save(SESSIONS_DB, s)
+            log_event("label", f"'{sess['user']}' relabeled own device")
         return redirect("/auth/portal")
     return page(TPL_PORTAL, title="SessionGuard // MY SESSIONS", bodyclass="gate",
                 error=None, **_portal_ctx(tok, sess))
@@ -1102,15 +1524,21 @@ def _portal_ctx(tok, sess):
             if v["user"] == sess["user"] and v["role"] == sess["role"]]
     mine.sort(key=lambda s: -s["last_seen"])
     u = load_users().get(sess["user"], {})
+    cur = load_sessions().get(tok, {})
     return {"user": sess["user"], "role": sess["role"], "as_limit": u.get("as", "\u221e"),
-            "sessions": mine, "csrf": sess["csrf"]}
+            "sessions": mine, "csrf": sess["csrf"], "current_label": cur.get("label", "")}
 
 # ═══════════════════════ ADMIN CONSOLE ═══════════════════════
 @app.route("/admin")
 @admin_required
 def admin_panel():
+    cfg = load_config()
     return page(TPL_ADMIN, title="SessionGuard // ADMIN", bodyclass="console",
-                admin=g.sess["user"], backend=get_target(), csrf=g.sess["csrf"])
+                admin=g.sess["user"], backend=get_target(), csrf=g.sess["csrf"],
+                ttl_hours=cfg.get("session_ttl_hours", 12),
+                rl_max=cfg.get("rate_limit_max", RATE_LIMIT_MAX),
+                rl_window=cfg.get("rate_limit_window", RATE_LIMIT_WINDOW),
+                ip_allow=cfg.get("ip_allow", ""), ip_deny=cfg.get("ip_deny", ""))
 
 @app.route("/api/config")
 @admin_required
@@ -1121,17 +1549,45 @@ def api_config():
 @admin_api
 def api_set_config():
     d = request.get_json(silent=True) or {}
-    target = str(d.get("target", "")).strip()
-    if not target:
-        return jsonify(ok=False, error="target address required"), 400
-    if not target.startswith(("http://", "https://")):
-        target = "http://" + target
     cfg = load_config()
-    old = cfg.get("target", "")
-    cfg["target"] = target
+    changes = []
+    if "target" in d:
+        target = str(d.get("target", "")).strip()
+        if not target:
+            return jsonify(ok=False, error="target address required"), 400
+        if not target.startswith(("http://", "https://")):
+            target = "http://" + target
+        old = cfg.get("target", "")
+        cfg["target"] = target
+        changes.append(f"target {old} -> {target}")
+    if "session_ttl_hours" in d:
+        try:
+            cfg["session_ttl_hours"] = max(1, float(d["session_ttl_hours"]))
+            changes.append(f"session TTL -> {cfg['session_ttl_hours']}h")
+        except (TypeError, ValueError):
+            return jsonify(ok=False, error="invalid session_ttl_hours"), 400
+    if "rate_limit_max" in d:
+        try:
+            cfg["rate_limit_max"] = max(3, int(d["rate_limit_max"]))
+            changes.append(f"rate limit -> {cfg['rate_limit_max']}")
+        except (TypeError, ValueError):
+            return jsonify(ok=False, error="invalid rate_limit_max"), 400
+    if "rate_limit_window" in d:
+        try:
+            cfg["rate_limit_window"] = max(1, int(d["rate_limit_window"]))
+            changes.append(f"rate window -> {cfg['rate_limit_window']}s")
+        except (TypeError, ValueError):
+            return jsonify(ok=False, error="invalid rate_limit_window"), 400
+    if "ip_allow" in d:
+        cfg["ip_allow"] = str(d["ip_allow"])[:2000]
+        changes.append("ip_allow updated")
+    if "ip_deny" in d:
+        cfg["ip_deny"] = str(d["ip_deny"])[:2000]
+        changes.append("ip_deny updated")
     save_config(cfg)
-    log_event("config", f"gateway target changed: {old} -> {target}")
-    return jsonify(ok=True, target=target)
+    if changes:
+        log_event("config", "gateway config changed: " + "; ".join(changes))
+    return jsonify(ok=True, config=cfg)
 
 @app.route("/api/stats")
 @admin_required
@@ -1155,7 +1611,9 @@ def api_users():
     for name, u in users.items():
         live = sum(1 for v in sessions.values() if v["user"] == name and v["role"] == "user")
         out.append({"username": name, "as": u["as"], "enabled": u["enabled"],
-                    "sessions": live, "at_limit": live >= u["as"]})
+                    "sessions": live, "at_limit": live >= u["as"],
+                    "target": u.get("target", ""), "ttl": u.get("ttl"),
+                    "ip_allow": u.get("ip_allow", ""), "ua_allow": u.get("ua_allow", "")})
     out.sort(key=lambda x: x["username"])
     return jsonify(ok=True, users=out)
 
@@ -1169,6 +1627,18 @@ def api_create_user():
         as_n = max(1, min(50, int(d.get("as", 1))))
     except (TypeError, ValueError):
         as_n = 1
+    target = str(d.get("target", "")).strip()
+    if target and not target.startswith(("http://", "https://")):
+        target = "http://" + target
+    ttl = d.get("ttl")
+    try:
+        ttl = max(60, int(ttl)) if ttl else None
+    except (TypeError, ValueError):
+        ttl = None
+    ip_allow, ip_err = _validate_ip_rule(d.get("ip_allow", ""))
+    if ip_err:
+        return jsonify(ok=False, error=ip_err), 400
+    ua_allow = str(d.get("ua_allow", ""))[:300].strip()
     if not re.match(r"^[a-z0-9_.-]{2,32}$", name):
         return jsonify(ok=False, error="username: 2-32 chars, a-z 0-9 _ . -"), 400
     if len(pw) < 8:
@@ -1180,9 +1650,15 @@ def api_create_user():
             return jsonify(ok=False, error="reserved username"), 409
         if name in users:
             return jsonify(ok=False, error="user already exists"), 409
-        users[name] = {"cred": hash_password(pw), "as": as_n, "enabled": True}
+        users[name] = {"cred": hash_password(pw), "as": as_n, "enabled": True,
+                       "target": target, "ttl": ttl, "ip_allow": ip_allow, "ua_allow": ua_allow}
         save_users(users)
-    log_event("user_create", f"user '{name}' provisioned (AS {as_n})")
+    extra = []
+    if target: extra.append(f"target {target}")
+    if ip_allow: extra.append(f"IP-restricted ({ip_allow})")
+    if ua_allow: extra.append(f"UA-restricted ({ua_allow})")
+    log_event("user_create", f"user '{name}' provisioned (AS {as_n}"
+              + (", " + ", ".join(extra) if extra else "") + ")")
     return jsonify(ok=True)
 
 @app.route("/api/users/<u>", methods=["PATCH"])
@@ -1205,6 +1681,28 @@ def api_edit_user(u):
                 return jsonify(ok=False, error="invalid AS"), 400
             users[u]["as"] = new
             changes.append(f"AS {old_as}->{new}")
+        if "target" in d:
+            t = str(d["target"]).strip()
+            if t and not t.startswith(("http://", "https://")):
+                t = "http://" + t
+            users[u]["target"] = t
+            changes.append(f"target -> {t or 'default'}")
+        if "ttl" in d:
+            ttl = d["ttl"]
+            try:
+                users[u]["ttl"] = max(60, int(ttl)) if ttl else None
+            except (TypeError, ValueError):
+                return jsonify(ok=False, error="invalid ttl"), 400
+            changes.append(f"ttl -> {users[u]['ttl'] or 'default'}")
+        if "ip_allow" in d:
+            cleaned, err = _validate_ip_rule(d["ip_allow"])
+            if err:
+                return jsonify(ok=False, error=err), 400
+            users[u]["ip_allow"] = cleaned
+            changes.append(f"IP restriction -> {cleaned or 'none'}")
+        if "ua_allow" in d:
+            users[u]["ua_allow"] = str(d["ua_allow"])[:300].strip()
+            changes.append(f"UA restriction -> {users[u]['ua_allow'] or 'none'}")
         save_users(users)
         disabled_now = "enabled" in d and not users[u]["enabled"]
         as_shrunk = "as" in d and users[u]["as"] < old_as
@@ -1259,7 +1757,8 @@ def api_delete_user(u):
 def api_sessions():
     purge_expired()
     out = [{"id": t[:10], "user": v["user"], "role": v["role"], "ip": v["ip"], "ua": v["ua"],
-            "created": v["created"], "last_seen": v["last_seen"], "current": t == g.tok}
+            "label": v.get("label", ""), "created": v["created"], "last_seen": v["last_seen"],
+            "current": t == g.tok}
            for t, v in load_sessions().items()]
     out.sort(key=lambda x: -x["last_seen"])
     return jsonify(ok=True, sessions=out)
@@ -1277,15 +1776,62 @@ def api_kill(sid):
     log_event("session_kill", f"'{victim['user']}' session terminated by admin ({victim['ip']})")
     return jsonify(ok=True)
 
+@app.route("/api/sessions/<sid>/label", methods=["POST"])
+@admin_api
+def api_label(sid):
+    label = str((request.get_json(silent=True) or {}).get("label", ""))[:60].strip()
+    with _lock:
+        s = load_sessions()
+        hits = [t for t in s if t.startswith(sid)]
+        if not hits:
+            return jsonify(ok=False, error="session not found"), 404
+        tok = hits[0]
+        s[tok]["label"] = label or _auto_label(s[tok].get("ua"))
+        _save(SESSIONS_DB, s)
+    log_event("label", f"session of '{s[tok]['user']}' relabeled by admin")
+    return jsonify(ok=True)
+
 @app.route("/api/events")
 @admin_required
 def api_events():
-    return jsonify(ok=True, events=_load(EVENTS_DB, [])[:30])
+    kind = request.args.get("kind") or None
+    user = request.args.get("user") or None
+    since = request.args.get("since")
+    since = int(since) if since and since.isdigit() else None
+    return jsonify(ok=True, events=query_events(kind, user, since, limit=200))
+
+@app.route("/api/events/export")
+@admin_required
+def api_events_export():
+    fmt = request.args.get("format", "json").lower()
+    kind = request.args.get("kind") or None
+    user = request.args.get("user") or None
+    events = query_events(kind, user, limit=500)
+    if fmt == "csv":
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["timestamp_utc", "kind", "detail"])
+        for e in events:
+            w.writerow([time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(e["ts"])), e["kind"], e["detail"]])
+        resp = Response(buf.getvalue(), mimetype="text/csv")
+        resp.headers["Content-Disposition"] = "attachment; filename=sessionguard-events.csv"
+        return resp
+    resp = Response(json.dumps(events, indent=2), mimetype="application/json")
+    resp.headers["Content-Disposition"] = "attachment; filename=sessionguard-events.json"
+    return resp
 
 # ═══════════════════════ THE GATEWAY (reverse proxy) ═══════════════════════
 STRIP_REQ  = {"host","content-length","connection","keep-alive","proxy-authenticate",
               "proxy-authorization","te","trailers","transfer-encoding","upgrade"}
 STRIP_RESP = {"content-encoding","content-length","transfer-encoding","connection"}
+
+def target_for(sess):
+    """Per-user TARGET override, falling back to the global default."""
+    if sess and sess.get("role") == "user":
+        u = load_users().get(sess["user"])
+        if u and u.get("target"):
+            return u["target"]
+    return get_target()
 
 @app.route("/", defaults={"path": ""}, methods=ALL_METHODS)
 @app.route("/<path:path>", methods=ALL_METHODS)
@@ -1300,8 +1846,15 @@ def gateway(path):
             if not u or not u["enabled"]:
                 kill_token(tok)
                 return redirect("/auth/login?err=disabled")
+            ok, reason = user_access_allowed(u, request.remote_addr or "", request.user_agent.string)
+            if not ok:
+                kill_token(tok)
+                log_event("user_restrict",
+                          f"'{sess['user']}' session killed: {'IP' if reason=='ip' else 'User-Agent'} "
+                          f"no longer matches account allowlist ({request.remote_addr})")
+                return redirect("/auth/login?err=restricted")
         touch(tok, sess)
-    target = get_target()
+    target = target_for(sess)
     if request.method != "OPTIONS" and not target:
         if sess and sess.get("role") == "admin":
             return redirect("/admin")
@@ -1352,9 +1905,9 @@ def cli_set_admin():
             continue
         break
     write_admin_record(name, p1)
-    print(f"  \033[38;5;78m[+]\033[0m {ADMIN_AUTH} written (PBKDF2 x{ROUNDS}, chmod 600)")
+    print(f"  \033[38;5;78m[+]\033[0m {ADMIN_AUTH} written (scrypt N={SCRYPT_N}, chmod 600)")
 
-def cli_add_user(name, as_n):
+def cli_add_user(name, as_n, target=None, ttl=None, ip_allow=None, ua_allow=None):
     import getpass
     mini_banner()
     name = name.lower()
@@ -1369,9 +1922,20 @@ def cli_add_user(name, as_n):
     if len(pw) < 8:
         print("  too short")
         return
-    users[name] = {"cred": hash_password(pw), "as": as_n, "enabled": True}
+    if target and not target.startswith(("http://", "https://")):
+        target = "http://" + target
+    ip_allow, ip_err = _validate_ip_rule(ip_allow or "")
+    if ip_err:
+        print(f"  {ip_err}")
+        return
+    users[name] = {"cred": hash_password(pw), "as": as_n, "enabled": True,
+                   "target": target or "", "ttl": ttl,
+                   "ip_allow": ip_allow, "ua_allow": (ua_allow or "").strip()}
     save_users(users)
-    print(f"  \033[38;5;78m[+]\033[0m {name}:<pbkdf2 hash> AS:{as_n}  -> {USERS_TXT}")
+    extra = f" TARGET:{target}" if target else ""
+    if ip_allow: extra += f" IP:{ip_allow}"
+    if ua_allow: extra += f" UA:{ua_allow}"
+    print(f"  \033[38;5;78m[+]\033[0m {name}:<scrypt hash> AS:{as_n}{extra}  -> {USERS_TXT}")
 
 # ═══════════════════════ MAIN ═══════════════════════
 if __name__ == "__main__":
@@ -1381,9 +1945,17 @@ if __name__ == "__main__":
     ap.add_argument("--add-user", metavar="NAME")
     ap.add_argument("--as", type=int, default=1, dest="max_as",
                     help="allowed sessions for --add-user")
+    ap.add_argument("--user-target", default=None,
+                    help="per-user backend override for --add-user, e.g. http://127.0.0.1:8080")
+    ap.add_argument("--user-ttl", type=int, default=None,
+                    help="per-user session TTL (seconds) for --add-user")
+    ap.add_argument("--user-ip", default=None,
+                    help="comma-separated IP/CIDR allowlist for --add-user, e.g. 10.0.0.0/24,203.0.113.5")
+    ap.add_argument("--user-ua", default=None,
+                    help="comma-separated User-Agent substring allowlist for --add-user, e.g. iPhone,Chrome")
     ap.add_argument("--list-users", action="store_true")
     ap.add_argument("--target", default=None,
-                    help="initial backend (changeable later from admin panel)")
+                    help="initial default backend (changeable later from admin panel)")
     ap.add_argument("--host", default="0.0.0.0",
                     help="bind address (default: 0.0.0.0)")
     ap.add_argument("--port", type=int, default=8000)
@@ -1394,13 +1966,17 @@ if __name__ == "__main__":
         sys.exit(0)
 
     if args.add_user:
-        cli_add_user(args.add_user, max(1, min(50, args.max_as)))
+        cli_add_user(args.add_user, max(1, min(50, args.max_as)), args.user_target, args.user_ttl,
+                    args.user_ip, args.user_ua)
         sys.exit(0)
 
     if args.list_users:
         mini_banner()
         for n, u in load_users().items():
-            print(f"  {n:<20} AS:{u['as']:<3} {'OFF' if not u['enabled'] else 'active'}")
+            extra = f" -> {u['target']}" if u.get("target") else ""
+            if u.get("ip_allow"): extra += f" IP:{u['ip_allow']}"
+            if u.get("ua_allow"): extra += f" UA:{u['ua_allow']}"
+            print(f"  {n:<20} AS:{u['as']:<3} {'OFF' if not u['enabled'] else 'active':<8}{extra}")
         sys.exit(0)
 
     if not ADMIN_AUTH.exists():
@@ -1413,9 +1989,12 @@ if __name__ == "__main__":
 
     if not USERS_TXT.exists():
         USERS_TXT.write_text(
-            "# SessionGuard users — user:credential AS:<allowed sessions> [OFF]\n"
+            "# SessionGuard users — user:credential AS:<allowed sessions> [TARGET:url] [TTL:seconds]\n"
+            "#                      [IP:a.b.c.d,cidr,...] [UA:substr,...] [OFF]\n"
             "# example:  operator:ChangeMe!23 AS:2\n"
-            "# plaintext credentials are auto-hashed on first login\n")
+            "# example:  robby:ChangeMe!23 AS:1 TARGET:http://127.0.0.1:8080\n"
+            "# example:  bibi:ChangeMe!23 AS:1 TARGET:http://127.0.0.1:7070 IP:10.0.0.0/24 UA:Chrome\n"
+            "# plaintext credentials are auto-hashed (scrypt) on first login\n")
         os.chmod(USERS_TXT, 0o600)
 
     if args.target:
