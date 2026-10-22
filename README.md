@@ -1,291 +1,189 @@
-````md
+```
 ┌──────────────────────────────────────────────┐
 │        ◢ S E S S I O N G U A R D            │
 │        · auth gateway · session shield       │
 └──────────────────────────────────────────────┘
+```
 
-Made by Aryan Giri | giriaryan694-a11y
-````
 # ◢ SessionGuard
 
-**SessionGuard** is a secure HTTP authentication gateway and session enforcement shield for local web tools.
+**Made by Aryan Giri | giriaryan694-a11y**
 
-It sits in front of your app, handles authentication, enforces per-user concurrent session limits, and forwards only approved traffic to your backend service. It is built for simple deployment, fast user management, and low-friction control through a web admin panel.
-
----
-
-## What it does
-
-SessionGuard protects any **HTTP web app** running locally, such as:
-
-- internal dashboards
-- admin tools
-- browser-based utilities
-- private web services
-- local development apps exposed through a tunnel
-
-Instead of exposing your tool directly, you expose **SessionGuard**.
+SessionGuard is a small authentication gateway and reverse proxy for private HTTP web tools. It authenticates users, limits concurrent sessions, applies optional IP/User-Agent restrictions, and forwards approved requests to a configured backend.
 
 ```text
-client ──► cloudflared ──► SessionGuard :8000 ──► local tool (127.0.0.1:PORT)
-````
+browser ──► trusted HTTPS proxy/tunnel ──► SessionGuard ──► private web app
+                                             │
+                                      login + sessions
+                                      admin + audit log
+```
 
-Your tool stays private on `127.0.0.1`, while SessionGuard acts as the public gatekeeper.
+> **Security note:** SessionGuard is a personal/small-team access gate, not a substitute for a mature identity provider or a formal security review. Keep the backend private, use HTTPS for remote access, keep dependencies updated, and test the configuration before putting sensitive data behind it.
 
----
+## Features
 
-## Core features
-
-* **Authentication gateway** — every request hits a login gate first
-* **Per-user session limits** — `AS` (Allowed Sessions) controls how many concurrent browsers or devices a user can use
-* **Server-side CSRF protection** — single-use tokens stored in memory, no cookie dependency, works across browsers and privacy extensions
-* **Bruteforce lockout** — 5 failed attempts triggers a 5-minute lock per IP and per username
-* **Web admin panel** — full user management, session control, live backend routing, and audit log
-* **User self-service portal** — users can view and end their own sessions at `/auth/portal`
-* **Text-file user storage** — no database, no SQL, just `users.txt`
-* **Auto credential hashing** — plaintext passwords in `users.txt` are upgraded to PBKDF2-SHA256 (200k rounds) on first login
-* **Live backend target switching** — change where traffic is forwarded from the admin panel, no restart needed
-* **Audit logging** — all auth events, admin actions, and session changes are recorded
-* **No backend address leakage** — the login page never reveals the target backend address
-* **Simple deployment** — single Python file, Flask, no build step
-
----
-
-## Why SessionGuard
-
-SessionGuard is designed for the case where one tool needs controlled access by multiple users, but you do not want the overhead of a database or a full identity stack.
-
-It gives you:
-
-* a small attack surface
-* easy file-based management
-* strict session control per user
-* admin visibility into all active logins
-* a clean front door for local apps exposed through tunnels
-* no information leakage about internal infrastructure
-
----
-
-## How it works
-
-1. A client opens the gateway URL.
-2. SessionGuard shows a login page. No backend address, no admin links, and no internal details are exposed.
-3. The user authenticates with their credentials.
-4. SessionGuard checks how many active sessions that user already has.
-5. If the user is under their `AS` limit, a session is created and access is granted.
-6. If the limit is reached, the user is told their session limit has been reached and directed to free a slot.
-7. Approved traffic is forwarded to the configured backend target.
-8. Admin users are routed to the admin panel after login. Regular users are forwarded to the tool.
-
----
+- Login gateway with server-side sessions and CSRF validation for state-changing forms/API calls.
+- Per-user concurrent session limit (`AS`), session expiry, device labels, and a self-service session portal.
+- Admin panel for users, password resets, account disabling, backend routing, sessions, and audit events.
+- Scrypt password hashes; legacy PBKDF2 hashes and plaintext `users.txt` credentials are upgraded on successful login.
+- Five failed-login attempts trigger a five-minute lock for the source IP and username.
+- Request rate limiting, optional global/per-user IP allowlists, IP denylist, and per-user User-Agent matching.
+- Configurable global or per-user backend; accepted targets are HTTP(S) URLs without embedded credentials, query strings, or fragments.
+- Atomic state-file writes, restricted POSIX file permissions, response security headers and no-store behavior for authenticated proxied responses, bounded body sizes, and proxy hop-by-hop header filtering.
+- Dark/light admin UI, audit filtering, and JSON/CSV event export.
 
 ## Quick start
 
+Python 3.9+ is required.
+
 ```bash
 # Install dependencies
-pip install flask requests
+python -m pip install -r requirements.txt
 
-# 1. Set up the admin account
+# Create or replace the administrator credential
 python sessionguard.py --set-admin
 
-# 2. (Optional) Add users from CLI
+# Optional: create users from the CLI
 python sessionguard.py --add-user operator1 --as 2
 python sessionguard.py --add-user operator2 --as 1
 
-# 3. Start the gateway
+# Start on loopback (the default)
 python sessionguard.py --port 8000
 
-# 4. Expose SessionGuard through a tunnel (NOT the backend tool)
+# In another terminal, expose SessionGuard, never the backend directly
 cloudflared tunnel --url http://127.0.0.1:8000
 ```
 
-Open the tunnel URL. Every visitor hits the login page. Log in as admin to configure the backend target and manage users.
+When Cloudflare Tunnel is the only path to the loopback listener, enable trusted proxy headers so HTTPS cookies and source-IP restrictions work as expected. Set `SESSIONGUARD_TRUST_PROXY=1` **before starting SessionGuard**; exact commands for PowerShell and POSIX shells are shown below. Do not enable it when untrusted clients can connect directly to the app port.
 
----
+Open the tunnel URL and sign in as the admin. Set the backend target in **GATEWAY TARGET**. The backend should listen on loopback, for example `127.0.0.1:8080`.
+
+The default bind address is `127.0.0.1` so the gateway is not automatically exposed on every network interface. Use `--host 0.0.0.0` only when you deliberately need network access and have applied suitable firewall rules.
+
+SessionGuard uses Waitress by default. `--dev-server` selects Flask's development server for local development only; do not use that mode for remote/public deployments. Flask explicitly cautions against using its development server in production deployments: <https://flask.palletsprojects.com/en/stable/deploying/>.
 
 ## CLI reference
 
 ```text
-python sessionguard.py --set-admin              Create or overwrite the admin account
-python sessionguard.py --add-user NAME --as N   Add a user with N allowed sessions
-python sessionguard.py --list-users             List all users and their status
-python sessionguard.py --target HOST:PORT       Set initial backend target
-python sessionguard.py --host 0.0.0.0           Bind address (default: 0.0.0.0)
-python sessionguard.py --port 8000              Listen port (default: 8000)
+python sessionguard.py --set-admin
+python sessionguard.py --add-user NAME --as N
+python sessionguard.py --add-user NAME --as N --user-target http://127.0.0.1:8080
+python sessionguard.py --list-users
+python sessionguard.py --target http://127.0.0.1:8080
+python sessionguard.py --host 127.0.0.1 --port 8000
+python sessionguard.py --dev-server       # local development only
 ```
 
----
+Additional per-user options for `--add-user` are `--user-ttl SECONDS`, `--user-ip IP/CIDR,...`, and `--user-ua SUBSTRING,...`.
 
-## Admin panel
+## Admin panel and user portal
 
-After logging in as the admin user, you are routed to the admin panel automatically.
+After admin login, SessionGuard routes to `/admin`. The panel can create/edit/delete user accounts, reset passwords, enable/disable accounts, set allowed concurrent sessions, route users to different backends, terminate sessions, and inspect/export the audit log.
 
-From the admin panel you can:
-
-* set the gateway target — where authenticated traffic is forwarded
-* create, edit, and delete users
-* reset user passwords, which revokes all their sessions
-* increase or decrease Allowed Sessions per user
-* view all active sessions across all users
-* terminate any session remotely
-* disable or enable user accounts
-* review the full audit log
-
-The admin panel is never advertised at startup. There is no public link to it. Only authenticated admin sessions can reach it.
-
----
-
-## User portal
-
-Each authenticated user can manage their own sessions at `/auth/portal`.
-
-Users can:
-
-* see all their active sessions (IP, device, time)
-* end a specific session on another device
-* end all their sessions at once
-* free up a slot when they hit their session limit
-
----
+Authenticated users can open `/auth/portal` to view their own sessions, label a device, or revoke one/all of their own sessions. Password resets, account disabling, and account deletion revoke the affected user's sessions.
 
 ## User file format
 
-SessionGuard uses a plain text file (`users.txt`) for user storage.
-
-```txt
-# SessionGuard users — user:credential AS:<allowed sessions> [OFF]
-# plaintext credentials are auto-hashed on first login
-operator1:$a1b2c3...hash... AS:2
-operator2:$d4e5f6...hash... AS:1
-tempuser:SomePass123 AS:1 OFF
-```
-
-### Fields
-
-| Field               | Meaning                                                               |
-| ------------------- | --------------------------------------------------------------------- |
-| `operator1`         | Username (2–32 chars, `a-z 0-9 _ . -`)                                |
-| `$a1b2c3...hash...` | PBKDF2-SHA256 credential, auto-upgraded from plaintext on first login |
-| `AS:2`              | Allowed Sessions — max concurrent logins                              |
-| `OFF`               | Account disabled flag                                                 |
-
-If a user has `AS:1`, they can only be logged in on one browser or device at a time. A second login attempt is blocked until they free the slot.
-
----
-
-## Admin credential file
-
-The admin account is stored separately in `admin_auth.txt`:
-
-```txt
-admin|$salt$hash
-```
-
-* PBKDF2-SHA256, 200,000 rounds
-* file permissions set to `600`
-* never exposed through the web UI
-* never transmitted to the backend
-
----
-
-## Security model
-
-| Protection                 | Implementation                                                                               |
-| -------------------------- | -------------------------------------------------------------------------------------------- |
-| Password storage           | PBKDF2-SHA256, 200k rounds, random 16-byte salt                                              |
-| CSRF (login form)          | Server-side single-use tokens, 10-minute TTL, no cookie dependency                           |
-| CSRF (authenticated forms) | Session-bound token, validated on every state-changing request                               |
-| Bruteforce                 | 5 failures → 5-minute lockout per IP and per username                                        |
-| Session tokens             | `secrets.token_urlsafe(32)`, HttpOnly, SameSite=Lax, Secure when behind HTTPS                |
-| Session TTL                | 12 hours, auto-purged                                                                        |
-| Cookie stripping           | Gateway strips its own auth cookies by exact name before forwarding to backend               |
-| Backend isolation          | Target never shown on login page, never leaked in error pages                                |
-| File permissions           | `users.txt`, `admin_auth.txt`, `data/` all chmod `600/700`                                   |
-| Headers                    | CSP, X-Content-Type-Options, X-Frame-Options: DENY, Referrer-Policy, Cache-Control: no-store |
-| Session revocation         | All sessions killed on password reset, account disable, or user deletion                     |
-| Audit trail                | Last 100 events stored with timestamp, kind, and detail                                      |
-
----
-
-## HTTPS proxy support
-
-SessionGuard can sit behind an HTTPS proxy that terminates TLS and forwards plain HTTP locally.
+`users.txt` is created automatically. A record can contain the following whitespace-separated tokens:
 
 ```text
-client ──HTTPS──► proxy :443 ──HTTP──► SessionGuard :8000 ──► tool :PORT
+operator1:scrypt$16384$8$1$<32 hex salt chars>$<128 hex digest chars> AS:2
+operator2:plaintext-temporary-pass AS:1 OFF
+limiteduser:<credential> AS:1 TARGET:http://127.0.0.1:8081 TTL:3600 IP:127.0.0.1/32 UA:Firefox
 ```
 
-When `X-Forwarded-Proto: https` is present, session cookies are set with the `Secure` flag automatically.
+- `AS:n`: maximum number of concurrent user sessions; default `1`.
+- `TARGET:url`: optional per-user target; blank or absent uses the global target.
+- `TTL:seconds`: optional per-user inactivity timeout.
+- `IP:address/CIDR,...`: optional per-user source-IP allowlist.
+- `UA:substring,...`: optional case-insensitive User-Agent substring allowlist.
+- `OFF`: disable the account.
 
-Related project: [http2https](https://github.com/giriaryan694-a11y/http2https)
+The sample strings above are format examples, not usable credentials. Use long, unique passphrases. Plaintext entries exist only for backward compatibility and should be replaced by the automatic hash upgrade on a successful login. `sg_sid` is reserved for SessionGuard; the gateway drops an upstream `Set-Cookie` using that exact name so it cannot overwrite the auth session.
 
----
-
-## Deployment rules
+The admin credential is stored separately in `admin_auth.txt` using this format:
 
 ```text
-✓ Bind SessionGuard to 0.0.0.0:8000 (faces outward)
-✓ Bind your backend tool to 127.0.0.1:PORT (stays local)
-✓ Point cloudflared / tunnel at SessionGuard :8000
-✗ Never expose the backend tool directly
-✗ Never point the tunnel at the tool's port
+admin|scrypt$16384$8$1$<32 hex salt chars>$<128 hex digest chars>
 ```
 
----
+Files are set to restrictive mode bits on POSIX systems. Windows ACLs are separate from POSIX mode bits, so protect the project directory with appropriate Windows permissions as well.
+
+## Proxy and HTTPS configuration
+
+SessionGuard should sit behind the trusted HTTPS proxy/tunnel when accessed remotely. Cookies are marked `Secure` when Flask sees the request as HTTPS. If the trusted proxy terminates TLS and forwards HTTP to SessionGuard, enable proxy-header support only when direct untrusted clients cannot reach the app port.
+
+PowerShell:
+
+```powershell
+$env:SESSIONGUARD_TRUST_PROXY = "1"
+python sessionguard.py --host 127.0.0.1 --port 8000
+```
+
+Linux/macOS:
+
+```bash
+SESSIONGUARD_TRUST_PROXY=1 python sessionguard.py --host 127.0.0.1 --port 8000
+```
+
+This setting trusts one proxy's `X-Forwarded-For` and `X-Forwarded-Proto` values. **Do not enable it when untrusted clients can connect directly to SessionGuard.** Werkzeug documents that trusting spoofable proxy headers incorrectly is a security issue: <https://werkzeug.palletsprojects.com/en/stable/deployment/proxy_fix/>.
+
+## Security behavior and defaults
+
+| Control | Behavior |
+|---|---|
+| Password hashing | Scrypt (`N=16384, r=8, p=1`); PBKDF2-SHA256 legacy hashes are upgraded on login |
+| Session token | Random URL-safe token; `HttpOnly`, `SameSite=Lax`, `Secure` for HTTPS requests |
+| Session expiry | 12-hour default inactivity TTL; global and per-user settings |
+| CSRF | Single-use server-side login tokens plus session-bound tokens for state changes |
+| Login lockout | Five failures; five-minute lock for IP and username |
+| Rate limit | Default 240 requests per source IP per 60 seconds; configurable from admin |
+| Proxy auth | All gateway methods, including `OPTIONS`, require a session |
+| Proxy headers | Strips standard and `Connection`-nominated hop-by-hop headers; client-supplied forwarding and `X-SG-User` headers are replaced/removed |
+| Malformed restrictions | Invalid non-empty IP or User-Agent restriction values fail closed rather than becoming unrestricted |
+| Private response caching | Authenticated proxied responses receive `Cache-Control: no-store` and security headers |
+| Backend target | Validated HTTP(S) URL; no target supplied by request data |
+| Cookie namespace | `sg_sid` is reserved for SessionGuard; an upstream cookie with that exact name is dropped |
+| Request size | 64 MiB default limit; override with `SESSIONGUARD_MAX_BODY` |
+| State persistence | Atomic JSON/text-file writes; designed for one process and small deployments |
 
 ## File structure
 
 ```text
-sessionguard/
-├── sessionguard.py        ← the entire gateway (single file)
-├── requirements.txt       ← flask, requests
+SessionGuard-main/
+├── sessionguard.py
+├── requirements.txt
 ├── README.md
-├── admin_auth.txt         ← admin credential (chmod 600, auto-created)
-├── users.txt              ← user registry (chmod 600, auto-created)
-└── data/                  ← runtime state (chmod 700, auto-created)
-    ├── sessions.json      ← active session tokens
-    ├── events.json        ← audit log (last 100)
-    └── config.json        ← gateway target
+├── tests/
+│   └── test_sessionguard.py
+├── admin_auth.txt       # created at setup
+├── users.txt            # created at startup
+└── data/                # created at startup
+    ├── sessions.json
+    ├── events.json
+    └── config.json
 ```
 
----
+## Tests
 
-## Technology stack
+After installing dependencies, run:
 
-* **Python 3**
-* **Flask** — web framework and reverse proxy
-* **requests** — upstream forwarding
-* **Embedded HTML/CSS/JS** — no build step, no external assets except Google Fonts
-* **Text-file + JSON storage** — no database
+```bash
+python -m unittest discover -s tests -v
+```
 
----
+The regression tests cover target validation, fail-closed IP allowlist parsing, credential hash checks, unauthenticated `OPTIONS`, upstream header filtering, duplicate `Set-Cookie` forwarding, and file permissions where supported.
 
 ## Limitations
 
-* Designed for **HTTP web apps only**
-* Not intended for raw TCP or UDP services
-* WebSocket proxying may require extra handling
-* Text-file storage is best for small to medium private setups
-* Single-process Flask dev server is sufficient for the intended use case
-* In-memory CSRF token store resets on restart, so users just reload the login page
-
----
-
-## Roadmap ideas
-
-* optional TOTP / MFA for admin login
-* per-user device labels and naming
-* configurable session expiry
-* activity log export (JSON / CSV)
-* IP-based allow/deny rules
-* rate limiting on the gateway itself
-* theme toggle for the admin panel
-* structured logging with log levels
-* health-check endpoint for monitoring
-
----
+- HTTP web apps only; WebSockets and raw TCP/UDP are not supported.
+- JSON/text files are not a multi-process database. Run a single SessionGuard process and keep the state directory private.
+- This version has been syntax-checked and its pure helper functions smoke-tested in the authoring sandbox, but its Flask integration suite still needs to be run after installing dependencies.
+- IP detection behind a proxy depends on correct, explicitly enabled trusted-proxy configuration.
+- There is no MFA/TOTP, distributed session store, database transaction layer, or independent security audit.
+- Do not expose the backend directly, and do not assume this gateway fixes vulnerabilities in the protected application.
 
 ## Made by
 
-* Made by Aryan Giri | giriaryan694-a11y
-* GitHub: https://github.com/giriaryan694-a11y
+**Aryan Giri | giriaryan694-a11y**  
+GitHub: https://github.com/giriaryan694-a11y
