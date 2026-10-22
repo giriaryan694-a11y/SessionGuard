@@ -43,14 +43,15 @@
      subsequent gateway/portal request (a session is killed mid-flight if
      the source IP or UA stops matching).
 """
-import argparse, csv, hashlib, hmac, io, ipaddress, json, os, re, secrets, sys, threading, time
-from urllib.parse import quote
+import argparse, csv, hashlib, hmac, io, ipaddress, json, math, os, re, secrets, sys, threading, time
+from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 from functools import wraps
 from pathlib import Path
 
 import requests as rq
 from flask import (Flask, request, redirect, url_for, render_template_string,
                    make_response, jsonify, g, Response)
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 # ═══════════════════════ CONFIG ═══════════════════════
 BASE        = Path(__file__).parent
@@ -67,6 +68,12 @@ DEFAULT_SESSION_TTL = 60 * 60 * 12        # 12h, admin-configurable
 SID_COOKIE  = "sg_sid"
 LOCK_ATTEMPTS, LOCK_SECONDS = 5, 300
 RATE_LIMIT_MAX, RATE_LIMIT_WINDOW = 240, 60    # admin-configurable
+MAX_PASSWORD_LENGTH = 1024
+try:
+    MAX_REQUEST_BODY = max(1024, min(1024 * 1024 * 1024,
+                                    int(os.environ.get("SESSIONGUARD_MAX_BODY", str(64 * 1024 * 1024)))))
+except (TypeError, ValueError, OverflowError):
+    MAX_REQUEST_BODY = 64 * 1024 * 1024
 ALL_METHODS = ["GET","POST","PUT","DELETE","PATCH","OPTIONS","HEAD"]
 PBKDF2_HASH_RE = re.compile(r"^[0-9a-f]{32}\$[0-9a-f]{64}$")
 SCRYPT_HASH_RE = re.compile(r"^scrypt\$\d+\$\d+\$\d+\$[0-9a-f]{32}\$[0-9a-f]+$")
@@ -89,14 +96,24 @@ CREDIT_HTML = (f'<a href="{GITHUB_URL}" target="_blank" rel="noopener noreferrer
 
 _lock   = threading.RLock()
 _fails  = {}
+_fails_lock = threading.RLock()
 # server-side single-use CSRF token store for the login form
 _csrf_tokens: dict[str, float] = {}
+_csrf_lock = threading.RLock()
 CSRF_TOKEN_TTL = 600  # 10 minutes
+CSRF_TOKEN_MAX = 20000
 # sliding-window rate limiter state: key -> [timestamps]
 _rl_hits: dict[str, list] = {}
+_rl_last_logged: dict[str, float] = {}
 _rl_lock = threading.RLock()
+_rl_last_cleanup = 0.0
 
 app     = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = max(1024, MAX_REQUEST_BODY)
+# Trust exactly one reverse proxy only when explicitly enabled. Never turn this
+# on if untrusted clients can connect directly to SessionGuard's listening port.
+if os.environ.get("SESSIONGUARD_TRUST_PROXY", "0").strip().lower() in {"1", "true", "yes"}:
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=0, x_port=0, x_prefix=0)
 
 # ═══════════════════════ BANNER / CREDIT ═══════════════════════
 def banner(host, port, target):
@@ -932,14 +949,26 @@ def _now(): return int(time.time())
 def _load(p, default):
     if not p.exists(): return default
     try: return json.loads(p.read_text())
-    except json.JSONDecodeError: return default
+    except (json.JSONDecodeError, OSError): return default
 
 def _save(p, obj):
-    DATA.mkdir(exist_ok=True)
-    tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps(obj, indent=2))
-    os.replace(tmp, p)
-    os.chmod(p, 0o600)
+    """Write JSON atomically without briefly exposing a permissive temp file."""
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(f".{p.name}.{secrets.token_hex(6)}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(obj, handle, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, p)
+        os.chmod(p, 0o600)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 # ═══════════════════════ GATEWAY / SECURITY CONFIG ═══════════════════════
 DEFAULT_CONFIG = {
@@ -953,7 +982,9 @@ DEFAULT_CONFIG = {
 
 def load_config():
     cfg = dict(DEFAULT_CONFIG)
-    cfg.update(_load(CONFIG_DB, {}))
+    stored = _load(CONFIG_DB, {})
+    if isinstance(stored, dict):
+        cfg.update(stored)
     return cfg
 
 def save_config(cfg):
@@ -962,19 +993,77 @@ def save_config(cfg):
 def get_target():
     return (load_config().get("target") or "").strip()
 
+def normalize_target(raw, allow_empty=False):
+    """Validate a fixed backend origin/path before it is used for proxying.
+
+    This intentionally allows loopback and private addresses because the main
+    use case is protecting locally hosted tools. Only an administrator may set
+    the target; request input is never used as the upstream hostname.
+    """
+    value = str(raw or "").strip()
+    if not value:
+        if allow_empty:
+            return ""
+        raise ValueError("target address is required")
+    if len(value) > 2048 or any(ord(ch) < 32 for ch in value) or "\\" in value:
+        raise ValueError("target contains invalid characters or is too long")
+    if not value.lower().startswith(("http://", "https://")):
+        # Accept convenient host[:port][/path] input, but don't reinterpret an
+        # unsupported URI scheme such as ftp:// as an HTTP hostname.
+        if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", value):
+            raise ValueError("only HTTP(S) target URLs are supported")
+        scheme_like = re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:(.*)$", value)
+        if scheme_like and not re.fullmatch(r"\d+(?:/.*)?", scheme_like.group(1)):
+            raise ValueError("target must be a host[:port][/path] or an HTTP(S) URL")
+        value = "http://" + value
+    try:
+        parts = urlsplit(value)
+        # Accessing .port validates malformed and out-of-range ports.
+        port = parts.port
+    except ValueError as exc:
+        raise ValueError("target URL has an invalid host or port") from exc
+    if parts.scheme.lower() not in ("http", "https") or not parts.hostname:
+        raise ValueError("target must be an HTTP(S) URL with a hostname")
+    if any(ch.isspace() or ch == "%" for ch in parts.netloc):
+        raise ValueError("target host must not contain whitespace or percent-encoding")
+    host = parts.hostname
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        try:
+            ascii_host = host.encode("idna").decode("ascii")
+        except UnicodeError as exc:
+            raise ValueError("target hostname is invalid") from exc
+        labels = ascii_host.rstrip(".").split(".")
+        label_re = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
+        if (len(ascii_host) > 253 or not labels
+                or any(not label_re.fullmatch(label) for label in labels)):
+            raise ValueError("target hostname is invalid")
+    if parts.username is not None or parts.password is not None:
+        raise ValueError("target URLs must not contain embedded credentials")
+    if parts.query or parts.fragment:
+        raise ValueError("target must not include a query string or fragment")
+    if port is not None and not 1 <= port <= 65535:
+        raise ValueError("target port must be between 1 and 65535")
+    # Normalize scheme and trailing slash while preserving any backend path.
+    return urlunsplit((parts.scheme.lower(), parts.netloc, parts.path.rstrip("/"), "", ""))
+
 def get_session_ttl():
     hrs = load_config().get("session_ttl_hours", DEFAULT_SESSION_TTL // 3600)
     try:
-        return max(60, int(float(hrs) * 3600))
-    except (TypeError, ValueError):
+        hours = float(hrs)
+        if not math.isfinite(hours):
+            raise ValueError
+        return max(60, min(8760 * 3600, int(hours * 3600)))
+    except (TypeError, ValueError, OverflowError):
         return DEFAULT_SESSION_TTL
 
 def get_rate_limit():
     cfg = load_config()
     try:
-        return max(3, int(cfg.get("rate_limit_max", RATE_LIMIT_MAX))), \
-               max(1, int(cfg.get("rate_limit_window", RATE_LIMIT_WINDOW)))
-    except (TypeError, ValueError):
+        return max(3, min(100000, int(cfg.get("rate_limit_max", RATE_LIMIT_MAX)))), \
+               max(1, min(86400, int(cfg.get("rate_limit_window", RATE_LIMIT_WINDOW))))
+    except (TypeError, ValueError, OverflowError):
         return RATE_LIMIT_MAX, RATE_LIMIT_WINDOW
 
 def _parse_ip_list(raw):
@@ -993,25 +1082,36 @@ def ip_allowed(ip):
     try:
         addr = ipaddress.ip_address(ip)
     except ValueError:
-        return True  # can't parse -> don't block on our own confusion
-    deny = _parse_ip_list(cfg.get("ip_deny", ""))
+        return False
+    raw_deny = str(cfg.get("ip_deny", "") or "").strip()
+    deny_tokens = [tok.strip() for tok in raw_deny.split(",") if tok.strip()]
+    deny = _parse_ip_list(raw_deny)
+    # Malformed restrictions must not silently become weaker after a typo or
+    # hand-edited config file. An invalid denylist blocks access until repaired.
+    if raw_deny and (not deny or len(deny) != len(deny_tokens)):
+        return False
     if any(addr in n for n in deny):
         return False
-    allow = _parse_ip_list(cfg.get("ip_allow", ""))
-    if allow and not any(addr in n for n in allow):
+    raw_allow = str(cfg.get("ip_allow", "") or "").strip()
+    allow_tokens = [tok.strip() for tok in raw_allow.split(",") if tok.strip()]
+    allow = _parse_ip_list(raw_allow)
+    if raw_allow and (not allow or len(allow) != len(allow_tokens)
+                      or not any(addr in n for n in allow)):
         return False
     return True
 
 def _validate_ip_rule(raw):
     """Validates a comma-separated IP/CIDR list for the per-user IP field.
     Returns (cleaned_string, error_message_or_None)."""
-    raw = str(raw or "").strip()[:500]
+    raw = str(raw or "").strip()
     if not raw:
         return "", None
-    for tok in raw.split(","):
-        tok = tok.strip()
-        if not tok:
-            continue
+    if len(raw) > 500:
+        return "", "IP/CIDR allowlist is too long (maximum 500 characters)"
+    tokens = [tok.strip() for tok in raw.split(",") if tok.strip()]
+    if not tokens:
+        return "", "enter at least one IP address or CIDR, or leave the field blank"
+    for tok in tokens:
         try:
             ipaddress.ip_network(tok, strict=False)
         except ValueError:
@@ -1026,27 +1126,45 @@ def user_access_allowed(u, ip, ua):
         return True, ""
     ip_rule = (u.get("ip_allow") or "").strip()
     if ip_rule:
+        ip_tokens = [tok.strip() for tok in ip_rule.split(",") if tok.strip()]
         nets = _parse_ip_list(ip_rule)
         try:
             addr = ipaddress.ip_address(ip)
         except ValueError:
             return False, "ip"
-        if nets and not any(addr in n for n in nets):
+        if not nets or len(nets) != len(ip_tokens) or not any(addr in n for n in nets):
             return False, "ip"
     ua_rule = (u.get("ua_allow") or "").strip()
     if ua_rule:
         needles = [t.strip().lower() for t in ua_rule.split(",") if t.strip()]
         haystack = (ua or "").lower()
-        if needles and not any(n in haystack for n in needles):
+        if not needles or not any(n in haystack for n in needles):
             return False, "ua"
     return True, ""
 
 # ═══════════════════════ RATE LIMITING ═══════════════════════
 def rate_limited(key):
     """Sliding-window check. Returns True if the caller should be blocked."""
+    global _rl_last_cleanup
     limit, window = get_rate_limit()
-    now = time.time()
     with _rl_lock:
+        now = time.time()
+        # Opportunistically discard idle keys so rotating source IPs cannot grow
+        # this in-memory table forever. Cleanup runs at most once per window.
+        if now - _rl_last_cleanup >= window:
+            cutoff_all = now - window
+            for old_key in [k for k, values in _rl_hits.items()
+                            if not values or values[-1] < cutoff_all]:
+                _rl_hits.pop(old_key, None)
+            for old_key, logged_at in list(_rl_last_logged.items()):
+                if logged_at < cutoff_all:
+                    _rl_last_logged.pop(old_key, None)
+            _rl_last_cleanup = now
+        if key not in _rl_hits and len(_rl_hits) >= 10000:
+            # Keep the table bounded without allowing one burst of fresh IPs to
+            # permanently lock out every new visitor.
+            oldest = min(_rl_hits, key=lambda k: _rl_hits[k][-1] if _rl_hits[k] else 0)
+            _rl_hits.pop(oldest, None)
         hits = _rl_hits.setdefault(key, [])
         cutoff = now - window
         while hits and hits[0] < cutoff:
@@ -1055,6 +1173,19 @@ def rate_limited(key):
             return True
         hits.append(now)
         return False
+
+def rate_limit_event_due(key, window):
+    """Throttle audit writes caused by a sustained 429 flood from one source."""
+    now = time.time()
+    with _rl_lock:
+        last = _rl_last_logged.get(key, 0.0)
+        if now - last < max(1, window):
+            return False
+        if key not in _rl_last_logged and len(_rl_last_logged) >= 10000:
+            oldest = min(_rl_last_logged, key=_rl_last_logged.get)
+            _rl_last_logged.pop(oldest, None)
+        _rl_last_logged[key] = now
+        return True
 
 # ═══════════════════════ CRYPTO ═══════════════════════
 def hash_password(pw):
@@ -1066,10 +1197,20 @@ def hash_password(pw):
 def _verify_scrypt(pw, stored):
     try:
         _, n, r, p, salt_hex, hash_hex = stored.split("$")
-        dk = hashlib.scrypt(pw.encode(), salt=bytes.fromhex(salt_hex),
-                            n=int(n), r=int(r), p=int(p), dklen=len(hash_hex) // 2)
+        n, r, p = int(n), int(r), int(p)
+        # Never feed attacker-controlled parameters from a damaged credential
+        # file directly into scrypt: that can otherwise consume huge RAM/CPU.
+        if (n < 2 ** 12 or n > 2 ** 15 or n & (n - 1)
+                or not 1 <= r <= 8 or not 1 <= p <= 2):
+            return False
+        if len(salt_hex) != 32 or len(hash_hex) < 64 or len(hash_hex) > 256 or len(hash_hex) % 2:
+            return False
+        salt = bytes.fromhex(salt_hex)
+        dk_len = len(hash_hex) // 2
+        dk = hashlib.scrypt(pw.encode(), salt=salt, n=n, r=r, p=p,
+                            dklen=dk_len, maxmem=64 * 1024 * 1024)
         return hmac.compare_digest(dk.hex(), hash_hex)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, OverflowError, MemoryError):
         return False
 
 def _verify_pbkdf2(pw, stored):
@@ -1101,7 +1242,17 @@ def read_admin_record():
     return n.strip(), r.strip()
 
 def write_admin_record(name, pw):
-    ADMIN_AUTH.write_text(f"{name}|{hash_password(pw)}\n")
+    tmp = ADMIN_AUTH.with_name(f".{ADMIN_AUTH.name}.{secrets.token_hex(6)}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(f"{name}|{hash_password(pw)}\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, ADMIN_AUTH)
+        os.chmod(ADMIN_AUTH, 0o600)
+    finally:
+        tmp.unlink(missing_ok=True)
     os.chmod(ADMIN_AUTH, 0o600)
 
 # ═══════════════════════ USERS.TXT ═══════════════════════
@@ -1112,15 +1263,22 @@ def load_users():
         if not raw.strip() or raw.lstrip().startswith("#"): continue
         m = LINE_RE.match(raw)
         if not m: continue
-        users[m.group(1).lower()] = {
-            "cred": m.group(2),
-            "as": max(1, min(50, int(m.group(3) or 1))),
-            "target": (m.group(4) or "").strip(),
-            "ttl": int(m.group(5)) if m.group(5) else None,
-            "ip_allow": (m.group(6) or "").strip(),
-            "ua_allow": (m.group(7) or "").strip(),
-            "enabled": m.group(8) is None,
-        }
+        try:
+            ttl = int(m.group(5)) if m.group(5) else None
+            if ttl is not None:
+                ttl = max(60, min(365 * 24 * 3600, ttl))
+            users[m.group(1).lower()] = {
+                "cred": m.group(2),
+                "as": max(1, min(50, int(m.group(3) or 1))),
+                "target": (m.group(4) or "").strip(),
+                "ttl": ttl,
+                "ip_allow": (m.group(6) or "").strip(),
+                "ua_allow": (m.group(7) or "").strip(),
+                "enabled": m.group(8) is None,
+            }
+        except (TypeError, ValueError, OverflowError):
+            # Ignore malformed local records rather than crashing every route.
+            continue
     return users
 
 def save_users(users):
@@ -1135,10 +1293,17 @@ def save_users(users):
         if u.get("ua_allow"): line += f" UA:{u['ua_allow']}"
         if not u["enabled"]: line += " OFF"
         lines.append(line)
-    tmp = USERS_TXT.with_suffix(".tmp")
-    tmp.write_text("\n".join(lines) + "\n")
-    os.replace(tmp, USERS_TXT)
-    os.chmod(USERS_TXT, 0o600)
+    tmp = USERS_TXT.with_name(f".{USERS_TXT.name}.{secrets.token_hex(6)}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(lines) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, USERS_TXT)
+        os.chmod(USERS_TXT, 0o600)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 def verify_user(name, pw, users):
     u = users.get(name)
@@ -1202,7 +1367,19 @@ def kill_all_for(user, role="user"):
     return len(dead)
 
 def count_sessions(user, role="user"):
+    purge_expired()
     return sum(1 for v in load_sessions().values() if v["user"] == user and v["role"] == role)
+
+def kill_all_admin_sessions():
+    """Revoke every admin session after the administrator credential is replaced."""
+    with _lock:
+        sessions = load_sessions()
+        dead = [token for token, value in sessions.items() if value.get("role") == "admin"]
+        for token in dead:
+            sessions.pop(token, None)
+        if dead:
+            _save(SESSIONS_DB, sessions)
+    return len(dead)
 
 def evict_excess(user, limit):
     with _lock:
@@ -1223,7 +1400,7 @@ def _effective_ttl(username, role):
         return get_session_ttl()
     u = load_users().get(username)
     if u and u.get("ttl"):
-        return max(60, u["ttl"])
+        return max(60, min(365 * 24 * 3600, int(u["ttl"])))
     return get_session_ttl()
 
 def purge_expired():
@@ -1279,15 +1456,20 @@ def _purge_csrf_tokens():
         del _csrf_tokens[k]
 
 def issue_login_csrf():
-    _purge_csrf_tokens()
-    token = secrets.token_urlsafe(32)
-    _csrf_tokens[token] = _now() + CSRF_TOKEN_TTL
-    return token
+    with _csrf_lock:
+        _purge_csrf_tokens()
+        if len(_csrf_tokens) >= CSRF_TOKEN_MAX:
+            oldest = min(_csrf_tokens, key=_csrf_tokens.get)
+            _csrf_tokens.pop(oldest, None)
+        token = secrets.token_urlsafe(32)
+        _csrf_tokens[token] = _now() + CSRF_TOKEN_TTL
+        return token
 
 def consume_login_csrf(token):
     if not token:
         return False
-    exp = _csrf_tokens.pop(token, None)
+    with _csrf_lock:
+        exp = _csrf_tokens.pop(token, None)
     if exp is None:
         return False
     return exp >= _now()
@@ -1302,8 +1484,27 @@ def page(tpl, status=200, **ctx):
                          "Cache-Control": "no-store"})
     return resp
 
+@app.errorhandler(413)
+def request_too_large(_error):
+    return page(TPL_BLOCKED, status=413, title="SessionGuard // REQUEST TOO LARGE",
+                bodyclass="gate", code="413", msg="REQUEST BODY TOO LARGE")
+
+@app.after_request
+def protect_sensitive_responses(resp):
+    """Prevent browsers from caching credential, admin, or proxied private data."""
+    path = request.path
+    if (getattr(g, "sessionguard_gateway", False)
+            or path.startswith(("/auth/", "/api/")) or path == "/admin"):
+        resp.headers["X-Content-Type-Options"] = "nosniff"
+        resp.headers["X-Frame-Options"] = "DENY"
+        resp.headers["Referrer-Policy"] = "no-referrer"
+        resp.headers["Cache-Control"] = "no-store"
+        if request.is_secure:
+            resp.headers.setdefault("Strict-Transport-Security", "max-age=31536000")
+    return resp
+
 def set_sid(resp, token, ttl):
-    secure = request.headers.get("X-Forwarded-Proto", "") == "https"
+    secure = request.is_secure
     resp.set_cookie(SID_COOKIE, token, httponly=True, samesite="Lax",
                     max_age=ttl, secure=secure, path="/")
     return resp
@@ -1314,13 +1515,36 @@ def safe_next(val):
     return "/"
 
 def locked(key):
-    return _fails.get(key, (0, 0))[1] > _now()
+    now = _now()
+    with _fails_lock:
+        entry = _fails.get(key)
+        if not entry:
+            return False
+        count, until, last = entry
+        if now - last >= LOCK_SECONDS:
+            _fails.pop(key, None)
+            return False
+        if until and until <= now:
+            _fails.pop(key, None)
+            return False
+        return until > now
 
 def record_fail(key):
-    c, _ = _fails.get(key, (0, 0))
-    c += 1
-    _fails[key] = (c, _now() + LOCK_SECONDS if c >= LOCK_ATTEMPTS else 0)
-    return c
+    now = _now()
+    with _fails_lock:
+        # Bound memory even if an attacker sprays arbitrary usernames.
+        for old_key, (_, _, last) in list(_fails.items()):
+            if now - last >= LOCK_SECONDS:
+                _fails.pop(old_key, None)
+        if key not in _fails and len(_fails) >= 10000:
+            oldest = min(_fails, key=lambda k: _fails[k][2])
+            _fails.pop(oldest, None)
+        previous = _fails.get(key)
+        c = previous[0] if previous and now - previous[2] < LOCK_SECONDS else 0
+        c += 1
+        until = now + LOCK_SECONDS if c >= LOCK_ATTEMPTS else 0
+        _fails[key] = (c, until, now)
+        return c
 
 def csrf_ok(sess):
     tok = request.form.get("csrf_token", "") or request.headers.get("X-CSRF-Token", "")
@@ -1359,7 +1583,9 @@ def _global_guards():
                     bodyclass="gate", code="403", msg="IP ADDRESS BLOCKED")
     rl_key = f"ip:{ip}"
     if rate_limited(rl_key):
-        log_event("rate_limit", f"rate limit hit for {ip} ({request.path})")
+        _, rl_window = get_rate_limit()
+        if rate_limit_event_due(rl_key, rl_window):
+            log_event("rate_limit", f"rate limit hit for {ip} ({request.path})")
         if request.path.startswith("/api/"):
             return jsonify(ok=False, error="rate limited"), 429
         return page(TPL_BLOCKED, status=429, title="SessionGuard // RATE LIMITED",
@@ -1403,6 +1629,10 @@ def login():
     pw   = request.form.get("password", "")
     nxt  = safe_next(request.form.get("next"))
 
+    # Avoid needlessly expensive credential work on unbounded form values.
+    if len(name) > 64 or len(pw) > MAX_PASSWORD_LENGTH:
+        return _login_page("ACCESS DENIED — invalid credentials", nxt), 401
+
     submitted_csrf = request.form.get("csrf_token", "")
     if not consume_login_csrf(submitted_csrf):
         return _login_page("CSRF CHECK FAILED — reload the page and retry", nxt), 403
@@ -1413,7 +1643,9 @@ def login():
 
     admin_name, admin_rec = read_admin_record()
     if admin_rec and admin_name and hmac.compare_digest(name, admin_name) and verify_password(pw, admin_rec):
-        _fails.pop(f"ip:{ip}", None)
+        with _fails_lock:
+            _fails.pop(f"ip:{ip}", None)
+            _fails.pop(f"u:{admin_name.lower()}", None)
         if is_legacy_hash(admin_rec):
             write_admin_record(admin_name, pw)
             log_event("cred_upgrade", "admin PBKDF2 credential upgraded to scrypt on login")
@@ -1428,8 +1660,9 @@ def login():
         users = load_users()
         u = users.get(key)
         if u and u["enabled"] and verify_user(key, pw, users):
-            _fails.pop(f"ip:{ip}", None)
-            _fails.pop(f"u:{key}", None)
+            with _fails_lock:
+                _fails.pop(f"ip:{ip}", None)
+                _fails.pop(f"u:{key}", None)
             ok, reason = user_access_allowed(u, ip, request.user_agent.string)
             if not ok:
                 log_event("user_restrict",
@@ -1549,40 +1782,50 @@ def api_config():
 @admin_api
 def api_set_config():
     d = request.get_json(silent=True) or {}
+    if not isinstance(d, dict):
+        return jsonify(ok=False, error="JSON body must be an object"), 400
     cfg = load_config()
     changes = []
     if "target" in d:
-        target = str(d.get("target", "")).strip()
-        if not target:
-            return jsonify(ok=False, error="target address required"), 400
-        if not target.startswith(("http://", "https://")):
-            target = "http://" + target
+        try:
+            target = normalize_target(d.get("target", ""))
+        except ValueError as exc:
+            return jsonify(ok=False, error=str(exc)), 400
         old = cfg.get("target", "")
         cfg["target"] = target
         changes.append(f"target {old} -> {target}")
     if "session_ttl_hours" in d:
         try:
-            cfg["session_ttl_hours"] = max(1, float(d["session_ttl_hours"]))
+            hours = float(d["session_ttl_hours"])
+            if not 1 <= hours <= 8760:
+                raise ValueError
+            cfg["session_ttl_hours"] = hours
             changes.append(f"session TTL -> {cfg['session_ttl_hours']}h")
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return jsonify(ok=False, error="invalid session_ttl_hours"), 400
     if "rate_limit_max" in d:
         try:
-            cfg["rate_limit_max"] = max(3, int(d["rate_limit_max"]))
+            cfg["rate_limit_max"] = max(3, min(100000, int(d["rate_limit_max"])))
             changes.append(f"rate limit -> {cfg['rate_limit_max']}")
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return jsonify(ok=False, error="invalid rate_limit_max"), 400
     if "rate_limit_window" in d:
         try:
-            cfg["rate_limit_window"] = max(1, int(d["rate_limit_window"]))
+            cfg["rate_limit_window"] = max(1, min(86400, int(d["rate_limit_window"])))
             changes.append(f"rate window -> {cfg['rate_limit_window']}s")
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return jsonify(ok=False, error="invalid rate_limit_window"), 400
     if "ip_allow" in d:
-        cfg["ip_allow"] = str(d["ip_allow"])[:2000]
+        ip_allow, ip_err = _validate_ip_rule(str(d["ip_allow"] or ""))
+        if ip_err:
+            return jsonify(ok=False, error=ip_err), 400
+        cfg["ip_allow"] = ip_allow
         changes.append("ip_allow updated")
     if "ip_deny" in d:
-        cfg["ip_deny"] = str(d["ip_deny"])[:2000]
+        ip_deny, ip_err = _validate_ip_rule(str(d["ip_deny"] or ""))
+        if ip_err:
+            return jsonify(ok=False, error=ip_err), 400
+        cfg["ip_deny"] = ip_deny
         changes.append("ip_deny updated")
     save_config(cfg)
     if changes:
@@ -1621,28 +1864,32 @@ def api_users():
 @admin_api
 def api_create_user():
     d = request.get_json(silent=True) or {}
+    if not isinstance(d, dict):
+        return jsonify(ok=False, error="JSON body must be an object"), 400
     name = str(d.get("username", "")).strip().lower()
     pw   = str(d.get("password", ""))
     try:
         as_n = max(1, min(50, int(d.get("as", 1))))
-    except (TypeError, ValueError):
-        as_n = 1
+    except (TypeError, ValueError, OverflowError):
+        return jsonify(ok=False, error="invalid AS"), 400
     target = str(d.get("target", "")).strip()
-    if target and not target.startswith(("http://", "https://")):
-        target = "http://" + target
+    try:
+        target = normalize_target(target, allow_empty=True)
+    except ValueError as exc:
+        return jsonify(ok=False, error=str(exc)), 400
     ttl = d.get("ttl")
     try:
-        ttl = max(60, int(ttl)) if ttl else None
-    except (TypeError, ValueError):
-        ttl = None
+        ttl = max(60, min(365 * 24 * 3600, int(ttl))) if ttl else None
+    except (TypeError, ValueError, OverflowError):
+        return jsonify(ok=False, error="invalid ttl"), 400
     ip_allow, ip_err = _validate_ip_rule(d.get("ip_allow", ""))
     if ip_err:
         return jsonify(ok=False, error=ip_err), 400
     ua_allow = str(d.get("ua_allow", ""))[:300].strip()
     if not re.match(r"^[a-z0-9_.-]{2,32}$", name):
         return jsonify(ok=False, error="username: 2-32 chars, a-z 0-9 _ . -"), 400
-    if len(pw) < 8:
-        return jsonify(ok=False, error="passkey must be >= 8 characters"), 400
+    if not 8 <= len(pw) <= MAX_PASSWORD_LENGTH:
+        return jsonify(ok=False, error=f"passkey must be 8-{MAX_PASSWORD_LENGTH} characters"), 400
     with _lock:
         users = load_users()
         admin_name, _ = read_admin_record()
@@ -1665,6 +1912,8 @@ def api_create_user():
 @admin_api
 def api_edit_user(u):
     d = request.get_json(silent=True) or {}
+    if not isinstance(d, dict):
+        return jsonify(ok=False, error="JSON body must be an object"), 400
     with _lock:
         users = load_users()
         if u not in users:
@@ -1672,26 +1921,29 @@ def api_edit_user(u):
         changes = []
         old_as = users[u]["as"]
         if "enabled" in d:
+            if not isinstance(d["enabled"], bool):
+                return jsonify(ok=False, error="enabled must be a boolean"), 400
             users[u]["enabled"] = bool(d["enabled"])
             changes.append("enabled" if users[u]["enabled"] else "disabled")
         if "as" in d:
             try:
                 new = max(1, min(50, int(d["as"])))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 return jsonify(ok=False, error="invalid AS"), 400
             users[u]["as"] = new
             changes.append(f"AS {old_as}->{new}")
         if "target" in d:
-            t = str(d["target"]).strip()
-            if t and not t.startswith(("http://", "https://")):
-                t = "http://" + t
+            try:
+                t = normalize_target(d["target"], allow_empty=True)
+            except ValueError as exc:
+                return jsonify(ok=False, error=str(exc)), 400
             users[u]["target"] = t
             changes.append(f"target -> {t or 'default'}")
         if "ttl" in d:
             ttl = d["ttl"]
             try:
-                users[u]["ttl"] = max(60, int(ttl)) if ttl else None
-            except (TypeError, ValueError):
+                users[u]["ttl"] = max(60, min(365 * 24 * 3600, int(ttl))) if ttl else None
+            except (TypeError, ValueError, OverflowError):
                 return jsonify(ok=False, error="invalid ttl"), 400
             changes.append(f"ttl -> {users[u]['ttl'] or 'default'}")
         if "ip_allow" in d:
@@ -1719,9 +1971,12 @@ def api_edit_user(u):
 @app.route("/api/users/<u>/password", methods=["POST"])
 @admin_api
 def api_reset_pass(u):
-    pw = str((request.get_json(silent=True) or {}).get("password", ""))
-    if len(pw) < 8:
-        return jsonify(ok=False, error="passkey must be >= 8 characters"), 400
+    d = request.get_json(silent=True) or {}
+    if not isinstance(d, dict):
+        return jsonify(ok=False, error="JSON body must be an object"), 400
+    pw = str(d.get("password", ""))
+    if not 8 <= len(pw) <= MAX_PASSWORD_LENGTH:
+        return jsonify(ok=False, error=f"passkey must be 8-{MAX_PASSWORD_LENGTH} characters"), 400
     with _lock:
         users = load_users()
         if u not in users:
@@ -1779,7 +2034,10 @@ def api_kill(sid):
 @app.route("/api/sessions/<sid>/label", methods=["POST"])
 @admin_api
 def api_label(sid):
-    label = str((request.get_json(silent=True) or {}).get("label", ""))[:60].strip()
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify(ok=False, error="JSON body must be an object"), 400
+    label = str(data.get("label", ""))[:60].strip()
     with _lock:
         s = load_sessions()
         hits = [t for t in s if t.startswith(sid)]
@@ -1822,7 +2080,7 @@ def api_events_export():
 
 # ═══════════════════════ THE GATEWAY (reverse proxy) ═══════════════════════
 STRIP_REQ  = {"host","content-length","connection","keep-alive","proxy-authenticate",
-              "proxy-authorization","te","trailers","transfer-encoding","upgrade"}
+              "proxy-authorization","te","trailer","trailers","transfer-encoding","upgrade"}
 STRIP_RESP = {"content-encoding","content-length","transfer-encoding","connection"}
 
 def target_for(sess):
@@ -1837,29 +2095,51 @@ def target_for(sess):
 @app.route("/<path:path>", methods=ALL_METHODS)
 def gateway(path):
     tok, sess = get_session()
-    if request.method != "OPTIONS":
-        if not sess:
-            nxt = quote("/" + path + ("?" + request.query_string.decode() if request.query_string else ""))
-            return redirect(f"/auth/login?next={nxt}")
-        if sess["role"] == "user":
-            u = load_users().get(sess["user"])
-            if not u or not u["enabled"]:
-                kill_token(tok)
-                return redirect("/auth/login?err=disabled")
-            ok, reason = user_access_allowed(u, request.remote_addr or "", request.user_agent.string)
-            if not ok:
-                kill_token(tok)
-                log_event("user_restrict",
-                          f"'{sess['user']}' session killed: {'IP' if reason=='ip' else 'User-Agent'} "
-                          f"no longer matches account allowlist ({request.remote_addr})")
-                return redirect("/auth/login?err=restricted")
-        touch(tok, sess)
+    # OPTIONS is a real request method. Do not let it bypass the auth gate.
+    if not sess:
+        try:
+            raw_query = request.query_string.decode("ascii")
+        except UnicodeDecodeError:
+            return page(TPL_BLOCKED, status=400, title="SessionGuard // BAD REQUEST",
+                        bodyclass="gate", code="400", msg="INVALID URL ENCODING")
+        nxt = quote("/" + path + ("?" + raw_query if raw_query else ""))
+        return redirect(f"/auth/login?next={nxt}")
+    if sess["role"] == "user":
+        u = load_users().get(sess["user"])
+        if not u or not u["enabled"]:
+            kill_token(tok)
+            return redirect("/auth/login?err=disabled")
+        ok, reason = user_access_allowed(u, request.remote_addr or "", request.user_agent.string)
+        if not ok:
+            kill_token(tok)
+            log_event("user_restrict",
+                      f"'{sess['user']}' session killed: {'IP' if reason=='ip' else 'User-Agent'} "
+                      f"no longer matches account allowlist ({request.remote_addr})")
+            return redirect("/auth/login?err=restricted")
+    # Proxied tools may otherwise emit cacheable responses containing private
+    # data. Mark successful gateway requests so the after_request hook disables
+    # browser caching without rewriting application-specific headers.
+    g.sessionguard_gateway = True
+    touch(tok, sess)
     target = target_for(sess)
-    if request.method != "OPTIONS" and not target:
+    if not target:
         if sess and sess.get("role") == "admin":
             return redirect("/admin")
         return page(TPL_NOTARGET, title="SessionGuard // NOT CONFIGURED", bodyclass="gate"), 503
-    headers = {k: v for k, v in request.headers if k.lower() not in STRIP_REQ}
+    try:
+        target = normalize_target(target)
+    except ValueError:
+        log_event("target_error", "invalid backend target rejected before proxying")
+        return page(TPL_DOWN, title="SessionGuard // INVALID TARGET", bodyclass="gate"), 502
+
+    # RFC hop-by-hop headers also include any fields named by Connection.
+    connection_tokens = set()
+    for header_name in ("Connection", "Proxy-Connection"):
+        connection_tokens.update(part.strip().lower() for part in request.headers.get(header_name, "").split(",")
+                                 if part.strip())
+    strip_req = STRIP_REQ | connection_tokens | {"x-sg-user"}
+    headers = {k: v for k, v in request.headers
+               if k.lower() not in strip_req and not k.lower().startswith("x-forwarded-")}
     kept = []
     for part in request.headers.get("Cookie", "").split(";"):
         part = part.strip()
@@ -1873,65 +2153,135 @@ def gateway(path):
     else:
         headers.pop("Cookie", None)
     headers["X-Forwarded-For"] = request.remote_addr or ""
-    headers["X-Forwarded-Proto"] = request.headers.get("X-Forwarded-Proto", "http")
+    headers["X-Forwarded-Proto"] = request.scheme
     if sess:
         headers["X-SG-User"] = sess["user"]
     try:
         up = rq.request(request.method, f"{target.rstrip('/')}/{path}",
-                        params=request.query_string.decode(), data=request.get_data(),
+                        params=request.query_string.decode("ascii"), data=request.get_data(),
                         headers=headers, stream=True, timeout=(5, 300), allow_redirects=False)
     except rq.RequestException:
         return page(TPL_DOWN, title="SessionGuard // 502", bodyclass="gate"), 502
-    resp = Response(up.iter_content(chunk_size=65536), status=up.status_code)
-    for k, v in up.raw.headers.items():
-        if k.lower() not in STRIP_RESP:
-            resp.headers.add(k, v)
+    except UnicodeDecodeError:
+        return page(TPL_BLOCKED, status=400, title="SessionGuard // BAD REQUEST",
+                    bodyclass="gate", code="400", msg="INVALID URL ENCODING")
+
+    connection_resp = set()
+    for part in up.headers.get("Connection", "").split(","):
+        if part.strip():
+            connection_resp.add(part.strip().lower())
+    strip_resp = STRIP_RESP | connection_resp | {"keep-alive", "proxy-authenticate",
+                                                "proxy-authorization", "te", "trailer", "upgrade",
+                                                "proxy-connection"}
+    resp = Response(status=up.status_code)
+    for k in up.raw.headers.keys():
+        if k.lower() not in strip_resp:
+            values = up.raw.headers.getlist(k) if hasattr(up.raw.headers, "getlist") else [up.raw.headers.get(k)]
+            for v in values:
+                # Reserve the gateway's session-cookie name. A backend Set-Cookie
+                # with this exact name could otherwise replace the auth token.
+                if k.lower() == "set-cookie" and v.split("=", 1)[0].strip() == SID_COOKIE:
+                    continue
+                # Keep redirects on this gateway when the backend returns its
+                # own absolute origin; do not send the browser to the private
+                # upstream host or let it bypass SessionGuard on redirect.
+                if k.lower() == "location":
+                    try:
+                        loc = urlsplit(urljoin(target.rstrip("/") + "/", v))
+                        base = urlsplit(target)
+                        loc_port = loc.port or (443 if loc.scheme.lower() == "https" else 80)
+                        base_port = base.port or (443 if base.scheme.lower() == "https" else 80)
+                        same_origin = (loc.scheme.lower(), (loc.hostname or "").lower(), loc_port) == (
+                            base.scheme.lower(), (base.hostname or "").lower(), base_port)
+                        if same_origin and urlsplit(v).netloc:
+                            loc_path = loc.path or "/"
+                            base_path = base.path.rstrip("/")
+                            if base_path and (loc_path == base_path or loc_path.startswith(base_path + "/")):
+                                loc_path = loc_path[len(base_path):] or "/"
+                            v = urlunsplit(("", "", loc_path, loc.query, loc.fragment))
+                    except ValueError:
+                        pass
+                resp.headers.add(k, v)
+
+    def stream_body():
+        try:
+            yield from up.iter_content(chunk_size=65536)
+        finally:
+            up.close()
+
+    resp.response = stream_body()
+    resp.call_on_close(up.close)
     return resp
 
 # ═══════════════════════ CLI ═══════════════════════
 def cli_set_admin():
     import getpass
     mini_banner()
+    replacing_existing = ADMIN_AUTH.exists()
     if ADMIN_AUTH.exists() and input("  admin_auth.txt exists — overwrite? [y/N] ").lower() != "y":
         return
     name = input("  Admin username [admin]: ").strip() or "admin"
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{2,32}", name):
+        print("  username must be 2-32 characters: letters, numbers, _, . or -")
+        return
     while True:
         p1 = getpass.getpass("  Admin passkey: ")
-        if len(p1) < 8:
-            print("  min 8 characters")
+        if not 8 <= len(p1) <= MAX_PASSWORD_LENGTH:
+            print(f"  passkey must be 8-{MAX_PASSWORD_LENGTH} characters")
             continue
         if p1 != getpass.getpass("  Confirm: "):
             print("  mismatch")
             continue
         break
     write_admin_record(name, p1)
+    if replacing_existing:
+        revoked = kill_all_admin_sessions()
+        with _fails_lock:
+            _fails.pop(f"u:{name.lower()}", None)
+        if revoked:
+            log_event("admin_reset", f"admin credential replaced; {revoked} admin session(s) revoked")
     print(f"  \033[38;5;78m[+]\033[0m {ADMIN_AUTH} written (scrypt N={SCRYPT_N}, chmod 600)")
 
 def cli_add_user(name, as_n, target=None, ttl=None, ip_allow=None, ua_allow=None):
     import getpass
     mini_banner()
     name = name.lower()
+    if not re.fullmatch(r"[a-z0-9_.-]{2,32}", name):
+        print("  username must be 2-32 characters: a-z, 0-9, _, . or -")
+        return
     admin_name, _ = read_admin_record()
     if admin_name and name == admin_name.lower():
         print(f"  '{name}' is the reserved admin username — pick another")
         return
     users = load_users()
-    if name in users and input(f"  '{name}' exists — overwrite? [y/N] ").lower() != "y":
+    replacing_existing = name in users
+    if replacing_existing and input(f"  '{name}' exists — overwrite? [y/N] ").lower() != "y":
         return
     pw = getpass.getpass(f"  Passkey for {name} (min 8): ")
-    if len(pw) < 8:
-        print("  too short")
+    if not 8 <= len(pw) <= MAX_PASSWORD_LENGTH:
+        print(f"  passkey must be 8-{MAX_PASSWORD_LENGTH} characters")
         return
-    if target and not target.startswith(("http://", "https://")):
-        target = "http://" + target
+    try:
+        target = normalize_target(target, allow_empty=True)
+    except ValueError as exc:
+        print(f"  invalid target: {exc}")
+        return
     ip_allow, ip_err = _validate_ip_rule(ip_allow or "")
     if ip_err:
         print(f"  {ip_err}")
+        return
+    if ttl is not None and not 60 <= ttl <= 365 * 24 * 3600:
+        print("  --user-ttl must be between 60 and 31536000 seconds")
         return
     users[name] = {"cred": hash_password(pw), "as": as_n, "enabled": True,
                    "target": target or "", "ttl": ttl,
                    "ip_allow": ip_allow, "ua_allow": (ua_allow or "").strip()}
     save_users(users)
+    if replacing_existing:
+        revoked = kill_all_for(name)
+        with _fails_lock:
+            _fails.pop(f"u:{name}", None)
+        log_event("user_overwrite", f"'{name}' account overwritten by CLI; {revoked} session(s) revoked")
     extra = f" TARGET:{target}" if target else ""
     if ip_allow: extra += f" IP:{ip_allow}"
     if ua_allow: extra += f" UA:{ua_allow}"
@@ -1956,9 +2306,11 @@ if __name__ == "__main__":
     ap.add_argument("--list-users", action="store_true")
     ap.add_argument("--target", default=None,
                     help="initial default backend (changeable later from admin panel)")
-    ap.add_argument("--host", default="0.0.0.0",
-                    help="bind address (default: 0.0.0.0)")
+    ap.add_argument("--host", default="127.0.0.1",
+                    help="bind address (default: 127.0.0.1; use 0.0.0.0 only when intentionally exposed)")
     ap.add_argument("--port", type=int, default=8000)
+    ap.add_argument("--dev-server", action="store_true",
+                    help="use Flask's development server instead of Waitress (local development only)")
     args = ap.parse_args()
 
     if args.set_admin:
@@ -1998,11 +2350,20 @@ if __name__ == "__main__":
         os.chmod(USERS_TXT, 0o600)
 
     if args.target:
+        try:
+            target = normalize_target(args.target)
+        except ValueError as exc:
+            ap.error(f"invalid --target: {exc}")
         cfg = load_config()
-        t = args.target if args.target.startswith("http") else f"http://{args.target}"
-        cfg["target"] = t
+        cfg["target"] = target
         save_config(cfg)
 
     purge_expired()
     banner(args.host, args.port, get_target())
-    app.run(host=args.host, port=args.port, threaded=True)
+    if args.dev_server:
+        print("  [!] Flask development server enabled; do not use this mode for public deployments.")
+        app.run(host=args.host, port=args.port, threaded=True)
+    else:
+        from waitress import serve
+        serve(app, host=args.host, port=args.port, threads=8,
+              max_request_body_size=max(1024, MAX_REQUEST_BODY))
